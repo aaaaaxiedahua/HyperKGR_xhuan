@@ -27,6 +27,13 @@ parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--fact_ratio', type=float, default=0.9)
 parser.add_argument('--epoch', type=int, default=300)
 parser.add_argument('--eval_interval', type=int, default=1)
+parser.add_argument('--shortcut_hops', type=int, default=3)
+parser.add_argument('--shortcut_topk', type=int, default=0)
+parser.add_argument('--shortcut_decay', type=float, default=0.5)
+parser.add_argument('--shortcut_lambda', type=float, default=0.15)
+parser.add_argument('--shortcut_candidate_cap', type=int, default=64)
+parser.add_argument('--d_hop', type=int, default=-1)
+parser.add_argument('--shortcut_prune_lambda', type=float, default=-1.0)
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -131,11 +138,36 @@ if __name__ == '__main__':
     checkPath(f'./results/{dataset}/')
     checkPath(f'{loader.task_dir}/saveModel/')
 
+    if opts.d_hop <= 0:
+        opts.d_hop = opts.hidden_dim
+    if opts.shortcut_prune_lambda < 0:
+        opts.shortcut_prune_lambda = opts.shortcut_lambda
+
     model = BaseModel(opts, loader)
     opts.perf_file = f'results/{dataset}/{model.modelName}_perf.txt'
     print(f'==> perf_file: {opts.perf_file}')
     
-    config_str = '%.4f, %.4f, %.6f,  %d, %d, %d, %d, %.4f,%s\n' % (opts.lr, opts.decay_rate, opts.lamb, opts.hidden_dim, opts.attn_dim, opts.n_layer, opts.n_batch, opts.dropout, opts.act)
+    config_str = (
+        '%.4f, %.4f, %.6f, %d, %d, %d, %d, %.4f, %s, shortcut_hops=%d, shortcut_topk=%d, shortcut_decay=%.4f, shortcut_lambda=%.4f, shortcut_candidate_cap=%d, d_hop=%d, shortcut_prune_lambda=%.4f\n'
+        % (
+            opts.lr,
+            opts.decay_rate,
+            opts.lamb,
+            opts.hidden_dim,
+            opts.attn_dim,
+            opts.n_layer,
+            opts.n_batch,
+            opts.dropout,
+            opts.act,
+            opts.shortcut_hops,
+            opts.shortcut_topk,
+            opts.shortcut_decay,
+            opts.shortcut_lambda,
+            opts.shortcut_candidate_cap,
+            opts.d_hop,
+            opts.shortcut_prune_lambda,
+        )
+    )
     print(config_str)
     with open(opts.perf_file, 'a+') as f:
         f.write(config_str)  

@@ -246,7 +246,26 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 ##########################################################################################################################################################################################
 
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, n_ent, n_node_topk=-1, n_edge_topk=-1, tau=1.0, act=lambda x:x):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        attn_dim,
+        n_rel,
+        n_ent,
+        n_node_topk=-1,
+        n_edge_topk=-1,
+        tau=1.0,
+        act=lambda x:x,
+        loader=None,
+        shortcut_hops=1,
+        shortcut_topk=0,
+        shortcut_decay=0.5,
+        shortcut_lambda=0.0,
+        shortcut_candidate_cap=64,
+        d_hop=None,
+        shortcut_prune_lambda=-1.0,
+    ):
         super(GNNLayer, self).__init__()
         self.n_rel       = n_rel
         self.n_ent       = n_ent
@@ -257,6 +276,7 @@ class GNNLayer(torch.nn.Module):
         self.n_node_topk = n_node_topk
         self.n_edge_topk = n_edge_topk
         self.tau         = tau
+        self.loader      = loader
         self.rela_embed  = nn.Embedding(2*n_rel+1, in_dim)
         self.Ws_attn     = nn.Linear(in_dim, attn_dim, bias=False)
         self.Wr_attn     = nn.Linear(in_dim, attn_dim, bias=False)
@@ -264,11 +284,139 @@ class GNNLayer(torch.nn.Module):
         self.w_alpha     = nn.Linear(attn_dim, 1)
         self.W_h         = nn.Linear(in_dim, out_dim, bias=False)
         self.W_samp      = nn.Linear(in_dim, 1, bias=False)
+        self.shortcut_hops = max(1, int(shortcut_hops))
+        self.shortcut_topk = int(shortcut_topk)
+        self.shortcut_decay = float(shortcut_decay)
+        self.shortcut_lambda = float(shortcut_lambda)
+        self.shortcut_candidate_cap = int(shortcut_candidate_cap)
+        self.d_hop = int(d_hop) if d_hop is not None and d_hop > 0 else out_dim
+        if shortcut_prune_lambda is None or shortcut_prune_lambda < 0:
+            self.shortcut_prune_lambda = self.shortcut_lambda
+        else:
+            self.shortcut_prune_lambda = float(shortcut_prune_lambda)
+        self.use_shortcut = (
+            self.loader is not None
+            and self.shortcut_hops >= 2
+            and self.shortcut_topk > 0
+            and self.shortcut_candidate_cap != 0
+            and (self.shortcut_lambda > 0 or self.shortcut_prune_lambda > 0)
+        )
+        if self.use_shortcut:
+            self.hop_embed = nn.Embedding(self.shortcut_hops + 1, self.d_hop)
+            self.W_sc_src = nn.Linear(out_dim, out_dim, bias=False)
+            self.W_sc_dst = nn.Linear(out_dim, out_dim, bias=False)
+            self.W_sc_query = nn.Linear(in_dim, out_dim, bias=False)
+            self.W_sc_hop = nn.Linear(self.d_hop, out_dim, bias=False)
+            self.w_sc_score = nn.Linear(out_dim, 1, bias=False)
+            self.W_sc_msg = nn.Linear(out_dim, out_dim, bias=False)
+            self.W_sc_hop_gate = nn.Linear(2 * out_dim, self.shortcut_hops - 1)
+            self.W_sc_fuse = nn.Linear(3 * out_dim, out_dim)
+            self.W_sc_prune = nn.Linear(3 * out_dim, 1, bias=False)
 
 
         # if the dataset is NELL, make it not changable
         self.curvature = torch.nn.Parameter(torch.tensor(1.0)) 
         #self.curvature = torch.tensor(1.0, requires_grad=False)
+
+    def _shortcut_k(self, hop):
+        decay = max(0.0, self.shortcut_decay)
+        return max(1, int(round(self.shortcut_topk * (decay ** max(0, hop - 2)))))
+
+    def _select_topk_per_source(self, src_idx, scores, k_h):
+        selected = torch.zeros_like(scores, dtype=torch.bool)
+        if src_idx.numel() == 0:
+            return selected
+
+        for src in torch.unique(src_idx):
+            local_mask = src_idx == src
+            local_count = int(local_mask.sum().item())
+            if local_count <= k_h:
+                selected[local_mask] = True
+                continue
+            local_positions = torch.nonzero(local_mask, as_tuple=False).view(-1)
+            top_positions = torch.topk(scores[local_mask], k=k_h).indices
+            selected[local_positions[top_positions]] = True
+        return selected
+
+    def _build_shortcut_context(self, hidden_new, nodes, q_rel, mode):
+        if not self.use_shortcut or hidden_new.numel() == 0:
+            return hidden_new, None
+
+        shortcut_edges = self.loader.get_shortcut_edges(
+            nodes,
+            max_hops=self.shortcut_hops,
+            candidate_cap=self.shortcut_candidate_cap,
+            mode=mode,
+        )
+        if len(shortcut_edges) == 0:
+            return hidden_new, None
+
+        n_node = hidden_new.size(0)
+        query_hidden = self.W_sc_query(self.rela_embed(q_rel[nodes[:, 0]]))
+        hop_messages = []
+        has_selected_edges = False
+
+        for hop in range(2, self.shortcut_hops + 1):
+            hop_message = hidden_new.new_zeros(n_node, self.out_dim)
+            edge_index = shortcut_edges.get(hop)
+            if edge_index is None:
+                hop_messages.append(hop_message)
+                continue
+
+            src_np, dst_np = edge_index
+            src_idx = torch.as_tensor(src_np, device=hidden_new.device, dtype=torch.long)
+            dst_idx = torch.as_tensor(dst_np, device=hidden_new.device, dtype=torch.long)
+            hop_ids = torch.full((src_idx.numel(),), hop, dtype=torch.long, device=hidden_new.device)
+
+            edge_hidden = torch.tanh(
+                self.W_sc_src(hidden_new[src_idx])
+                + self.W_sc_dst(hidden_new[dst_idx])
+                + query_hidden[src_idx]
+                + self.W_sc_hop(self.hop_embed(hop_ids))
+            )
+            edge_scores = self.w_sc_score(edge_hidden).squeeze(-1)
+
+            selected_mask = self._select_topk_per_source(src_idx, edge_scores, self._shortcut_k(hop))
+            src_idx = src_idx[selected_mask]
+            dst_idx = dst_idx[selected_mask]
+            edge_scores = edge_scores[selected_mask]
+
+            if src_idx.numel() == 0:
+                hop_messages.append(hop_message)
+                continue
+
+            has_selected_edges = True
+            edge_alpha = torch.zeros_like(edge_scores)
+            for src in torch.unique(src_idx):
+                local_mask = src_idx == src
+                edge_alpha[local_mask] = F.softmax(edge_scores[local_mask], dim=0)
+
+            hop_message = scatter(
+                edge_alpha.unsqueeze(-1) * self.W_sc_msg(hidden_new[dst_idx]),
+                index=src_idx,
+                dim=0,
+                dim_size=n_node,
+                reduce='sum',
+            )
+            hop_messages.append(hop_message)
+
+        if not has_selected_edges:
+            return hidden_new, None
+
+        hop_gate = torch.sigmoid(self.W_sc_hop_gate(torch.cat([hidden_new, query_hidden], dim=-1)))
+        shortcut_message = hidden_new.new_zeros(n_node, self.out_dim)
+        for hop_offset, hop_message in enumerate(hop_messages):
+            shortcut_message = shortcut_message + hop_gate[:, hop_offset:hop_offset+1] * hop_message
+
+        shortcut_features = torch.cat([hidden_new, shortcut_message, query_hidden], dim=-1)
+        fuse_gate = torch.sigmoid(self.W_sc_fuse(shortcut_features))
+        if self.shortcut_lambda > 0:
+            hidden_new = hidden_new + fuse_gate * (self.shortcut_lambda * shortcut_message)
+
+        shortcut_bonus = None
+        if self.shortcut_prune_lambda > 0:
+            shortcut_bonus = self.W_sc_prune(shortcut_features).squeeze(-1)
+        return hidden_new, shortcut_bonus
         
     def train(self, mode=True):
         if not isinstance(mode, bool):
@@ -282,7 +430,7 @@ class GNNLayer(torch.nn.Module):
             module.train(mode)
         return self
 
-    def forward(self, q_sub, q_rel, hidden, edges, nodes, old_nodes_new_idx, batchsize):
+    def forward(self, q_sub, q_rel, hidden, edges, nodes, old_nodes_new_idx, batchsize, mode='train'):
         # edges: [N_edge_of_all_batch, 6] 
         # with (batch_idx, head, rela, tail, head_idx, tail_idx)
         # note that head_idx and tail_idx are relative index
@@ -301,7 +449,7 @@ class GNNLayer(torch.nn.Module):
             alpha          = self.w_alpha(nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))).squeeze(-1)
             edge_prob      = F.gumbel_softmax(alpha, tau=1, hard=False)
             topk_index     = torch.argsort(edge_prob, descending=True)[:self.n_edge_topk]
-            edge_prob_hard = torch.zeros((alpha.shape[0])).cuda()
+            edge_prob_hard = torch.zeros((alpha.shape[0]), device=alpha.device)
             edge_prob_hard[topk_index] = 1
             alpha *= (edge_prob_hard - edge_prob.detach() + edge_prob)
             alpha = torch.sigmoid(alpha).unsqueeze(-1)
@@ -333,6 +481,7 @@ class GNNLayer(torch.nn.Module):
 
         #hidden_new  = self.act(self.W_h(message_agg)) # [n_node, dim]
         hidden_new  = hidden_new.clone()
+        hidden_new, shortcut_bonus = self._build_shortcut_context(hidden_new, nodes, q_rel, mode)
         
         # forward without node sampling
         if self.n_node_topk <= 0:
@@ -340,16 +489,18 @@ class GNNLayer(torch.nn.Module):
 
         # forward with node sampling
         # indexing sampling operation
-        tmp_diff_node_idx = torch.ones(n_node)
+        tmp_diff_node_idx = torch.ones(n_node, device=hidden_new.device)
         tmp_diff_node_idx[old_nodes_new_idx] = 0
-        bool_diff_node_idx = tmp_diff_node_idx.bool()
+        bool_diff_node_idx = tmp_diff_node_idx.bool().to(hidden_new.device)
         diff_node = nodes[bool_diff_node_idx]
 
         # project logit to fixed-size tensor via indexing
         diff_node_logit  = self.W_samp(hidden_new[bool_diff_node_idx]).squeeze(-1) # [all_batch_new_nodes]
+        if shortcut_bonus is not None:
+            diff_node_logit = diff_node_logit + self.shortcut_prune_lambda * shortcut_bonus[bool_diff_node_idx]
         
         # save logit to node_scores for later indexing
-        node_scores = torch.ones((batchsize, self.n_ent)).cuda() * float('-inf')
+        node_scores = torch.ones((batchsize, self.n_ent), device=hidden_new.device) * float('-inf')
         node_scores[diff_node[:,0], diff_node[:,1]] = diff_node_logit
 
         # select top-k nodes
@@ -357,20 +508,20 @@ class GNNLayer(torch.nn.Module):
         # (eval mode)  self.softmax == F.softmax 
         node_scores = self.softmax(node_scores) # [batchsize, n_ent]
         topk_index = torch.topk(node_scores, self.n_node_topk, dim=1).indices.reshape(-1)
-        topk_batchidx  = torch.arange(batchsize).repeat(self.n_node_topk,1).T.reshape(-1)
-        batch_topk_nodes = torch.zeros((batchsize, self.n_ent)).cuda()
+        topk_batchidx  = torch.arange(batchsize, device=hidden_new.device).repeat(self.n_node_topk,1).T.reshape(-1)
+        batch_topk_nodes = torch.zeros((batchsize, self.n_ent), device=hidden_new.device)
         batch_topk_nodes[topk_batchidx, topk_index] = 1
 
         # get sampled nodes' relative index
         bool_sampled_diff_nodes_idx = batch_topk_nodes[diff_node[:,0], diff_node[:,1]].bool()
-        bool_same_node_idx = ~bool_diff_node_idx.cuda()
+        bool_same_node_idx = ~bool_diff_node_idx
         bool_same_node_idx[bool_diff_node_idx] = bool_sampled_diff_nodes_idx
 
         # update node embeddings
         diff_node_prob_hard = batch_topk_nodes[diff_node[:,0], diff_node[:,1]]
         diff_node_prob = node_scores[diff_node[:,0], diff_node[:,1]]
         hidden_new[bool_diff_node_idx] *= (diff_node_prob_hard - diff_node_prob.detach() + diff_node_prob).unsqueeze(-1)
-        
+
         # extract sampled nodes an their embeddings
         new_nodes  = nodes[bool_same_node_idx]
         hidden_new = hidden_new[bool_same_node_idx]
@@ -388,6 +539,13 @@ class GNNModel(torch.nn.Module):
         self.n_node_topk = params.n_node_topk
         self.n_edge_topk = params.n_edge_topk
         self.loader      = loader
+        self.shortcut_hops = getattr(params, 'shortcut_hops', 1)
+        self.shortcut_topk = getattr(params, 'shortcut_topk', 0)
+        self.shortcut_decay = getattr(params, 'shortcut_decay', 0.5)
+        self.shortcut_lambda = getattr(params, 'shortcut_lambda', 0.0)
+        self.shortcut_candidate_cap = getattr(params, 'shortcut_candidate_cap', 64)
+        self.d_hop = getattr(params, 'd_hop', self.hidden_dim)
+        self.shortcut_prune_lambda = getattr(params, 'shortcut_prune_lambda', -1.0)
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act  = acts[params.act]
 
@@ -395,7 +553,11 @@ class GNNModel(torch.nn.Module):
         for i in range(self.n_layer):
             i_n_node_topk = self.n_node_topk if 'int' in str(type(self.n_node_topk)) else self.n_node_topk[i]
             self.gnn_layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, self.n_ent, \
-                                            n_node_topk=i_n_node_topk, n_edge_topk=self.n_edge_topk, tau=params.tau, act=act))
+                                            n_node_topk=i_n_node_topk, n_edge_topk=self.n_edge_topk, tau=params.tau, act=act, \
+                                            loader=self.loader, shortcut_hops=self.shortcut_hops, shortcut_topk=self.shortcut_topk, \
+                                            shortcut_decay=self.shortcut_decay, shortcut_lambda=self.shortcut_lambda, \
+                                            shortcut_candidate_cap=self.shortcut_candidate_cap, d_hop=self.d_hop, \
+                                            shortcut_prune_lambda=self.shortcut_prune_lambda))
 
         self.gnn_layers = nn.ModuleList(self.gnn_layers)       
         self.dropout = nn.Dropout(params.dropout)
@@ -431,7 +593,7 @@ class GNNModel(torch.nn.Module):
 
             # GNN forward -> get hidden representation at i-th layer
             # hidden: [k1, dim]
-            hidden, nodes, sampled_nodes_idx = self.gnn_layers[i](q_sub, q_rel, hidden, edges, nodes, old_nodes_new_idx, n)
+            hidden, nodes, sampled_nodes_idx = self.gnn_layers[i](q_sub, q_rel, hidden, edges, nodes, old_nodes_new_idx, n, mode=mode)
 
             # combine h0 and hi -> update hi with gate operation
             h0          = torch.zeros(1, n_node, hidden.size(1)).cuda().index_copy_(1, old_nodes_new_idx, h0)

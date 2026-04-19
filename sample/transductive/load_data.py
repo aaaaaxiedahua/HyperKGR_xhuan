@@ -86,6 +86,8 @@ class DataLoader:
         self.KG = np.concatenate([np.array(triples), idd], 0)
         self.n_fact = len(self.KG)
         self.M_sub = csr_matrix((np.ones((self.n_fact,)), (np.arange(self.n_fact), self.KG[:,0])), shape=(self.n_fact, self.n_ent))
+        self.graph_neighbors = self._build_graph_neighbors(self.KG)
+        self.graph_hop_cache = dict()
 
     def load_test_graph(self, triples):
         idd = np.concatenate([np.expand_dims(np.arange(self.n_ent),1), 2*self.n_rel*np.ones((self.n_ent, 1)), np.expand_dims(np.arange(self.n_ent),1)], 1)
@@ -93,6 +95,101 @@ class DataLoader:
         self.tKG = np.concatenate([np.array(triples), idd], 0)
         self.tn_fact = len(self.tKG)
         self.tM_sub = csr_matrix((np.ones((self.tn_fact,)), (np.arange(self.tn_fact), self.tKG[:,0])), shape=(self.tn_fact, self.n_ent))
+        self.test_graph_neighbors = self._build_graph_neighbors(self.tKG)
+        self.test_graph_hop_cache = dict()
+
+    def _build_graph_neighbors(self, kg):
+        neighbors = [[] for _ in range(self.n_ent)]
+        identity_rel = 2 * self.n_rel
+        for h, r, t in kg:
+            if r == identity_rel:
+                continue
+            neighbors[int(h)].append(int(t))
+        return [np.array(node_neighbors, dtype=np.int64) for node_neighbors in neighbors]
+
+    def _get_graph_context(self, mode):
+        if mode == 'train':
+            return self.graph_neighbors, self.graph_hop_cache
+        return self.test_graph_neighbors, self.test_graph_hop_cache
+
+    def _get_entity_hop_neighbors(self, ent_idx, mode, max_hops):
+        neighbors, hop_cache = self._get_graph_context(mode)
+        cache_key = (int(ent_idx), int(max_hops))
+        if cache_key in hop_cache:
+            return hop_cache[cache_key]
+
+        visited = {int(ent_idx)}
+        frontier = [int(ent_idx)]
+        hop_neighbors = dict()
+
+        for hop in range(1, max_hops + 1):
+            next_frontier = []
+            next_visited = set()
+            for node in frontier:
+                for neigh in neighbors[node]:
+                    neigh = int(neigh)
+                    if neigh in visited or neigh in next_visited:
+                        continue
+                    next_frontier.append(neigh)
+                    next_visited.add(neigh)
+
+            if hop >= 2:
+                hop_neighbors[hop] = tuple(next_frontier)
+
+            if not next_frontier:
+                break
+
+            visited.update(next_visited)
+            frontier = next_frontier
+
+        hop_cache[cache_key] = hop_neighbors
+        return hop_neighbors
+
+    def get_shortcut_edges(self, nodes, max_hops, candidate_cap, mode='train'):
+        if max_hops < 2 or len(nodes) == 0:
+            return dict()
+
+        if torch.is_tensor(nodes):
+            nodes = nodes.detach().cpu().numpy()
+
+        batch_nodes = defaultdict(dict)
+        for rel_idx, (batch_idx, ent_idx) in enumerate(nodes):
+            batch_nodes[int(batch_idx)][int(ent_idx)] = rel_idx
+
+        shortcut_edges = {hop: [[], []] for hop in range(2, max_hops + 1)}
+        max_candidates = None if candidate_cap is None or candidate_cap <= 0 else int(candidate_cap)
+
+        for src_rel_idx, (batch_idx, ent_idx) in enumerate(nodes):
+            batch_idx = int(batch_idx)
+            ent_idx = int(ent_idx)
+            hop_neighbors = self._get_entity_hop_neighbors(ent_idx, mode, max_hops)
+            active_nodes = batch_nodes[batch_idx]
+
+            for hop in range(2, max_hops + 1):
+                candidates = hop_neighbors.get(hop, ())
+                if len(candidates) == 0:
+                    continue
+
+                kept = 0
+                for cand_ent_idx in candidates:
+                    dst_rel_idx = active_nodes.get(int(cand_ent_idx))
+                    if dst_rel_idx is None or dst_rel_idx == src_rel_idx:
+                        continue
+                    shortcut_edges[hop][0].append(src_rel_idx)
+                    shortcut_edges[hop][1].append(dst_rel_idx)
+                    kept += 1
+                    if max_candidates is not None and kept >= max_candidates:
+                        break
+
+        packed_edges = dict()
+        for hop, (src_nodes, dst_nodes) in shortcut_edges.items():
+            if len(src_nodes) == 0:
+                continue
+            packed_edges[hop] = (
+                np.array(src_nodes, dtype=np.int64),
+                np.array(dst_nodes, dtype=np.int64),
+            )
+        return packed_edges
 
     def load_query(self, triples):
         trip_hr = defaultdict(lambda:list())
