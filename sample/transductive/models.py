@@ -246,13 +246,14 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 ##########################################################################################################################################################################################
 
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, n_ent, n_node_topk=-1, n_edge_topk=-1, tau=1.0, act=lambda x:x):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, n_ent, d_path, n_node_topk=-1, n_edge_topk=-1, tau=1.0, act=lambda x:x):
         super(GNNLayer, self).__init__()
         self.n_rel       = n_rel
         self.n_ent       = n_ent
         self.in_dim      = in_dim
         self.out_dim     = out_dim
         self.attn_dim    = attn_dim
+        self.d_path      = d_path
         self.act         = act
         self.n_node_topk = n_node_topk
         self.n_edge_topk = n_edge_topk
@@ -264,11 +265,6 @@ class GNNLayer(torch.nn.Module):
         self.w_alpha     = nn.Linear(attn_dim, 1)
         self.W_h         = nn.Linear(in_dim, out_dim, bias=False)
         self.W_samp      = nn.Linear(in_dim, 1, bias=False)
-
-
-        # if the dataset is NELL, make it not changable
-        self.curvature = torch.nn.Parameter(torch.tensor(1.0)) 
-        #self.curvature = torch.tensor(1.0, requires_grad=False)
         
     def train(self, mode=True):
         if not isinstance(mode, bool):
@@ -282,7 +278,8 @@ class GNNLayer(torch.nn.Module):
             module.train(mode)
         return self
 
-    def forward(self, q_sub, q_rel, hidden, edges, nodes, old_nodes_new_idx, batchsize):
+    def forward(self, q_sub, q_rel, hidden, path_state, edges, nodes, old_nodes_new_idx, batchsize,
+                curvature, path_rel, query_path_proto, lambda_q):
         # edges: [N_edge_of_all_batch, 6] 
         # with (batch_idx, head, rela, tail, head_idx, tail_idx)
         # note that head_idx and tail_idx are relative index
@@ -311,12 +308,12 @@ class GNNLayer(torch.nn.Module):
         
 
         # suppose all embedding are in tangetn space
-        hr = expmap0(hr, self.curvature)
-        hs = expmap0(hs, self.curvature)
+        hr = expmap0(hr, curvature)
+        hs = expmap0(hs, curvature)
 
-        message = project(mobius_add(hs, hr, self.curvature), self.curvature) # hyperbolic space, hyperbolic transE
+        message = project(mobius_add(hs, hr, curvature), curvature) # hyperbolic space, hyperbolic transE
         #message = mobius_add(hs, hr, 1) # hyperbolic space, hyperbolic transE
-        message = logmap0(message, self.curvature) # to tangent space
+        message = logmap0(message, curvature) # to tangent space
         #message = hs + hr
 
 
@@ -327,20 +324,52 @@ class GNNLayer(torch.nn.Module):
         # to poincare space
         a__ = self.W_h(message_agg)
         #a__ = p_exp_map(a__)
-        a__ = expmap0(a__, self.curvature)
+        a__ = expmap0(a__, curvature)
         hidden_new = self.act(a__)
-        hidden_new = logmap0(hidden_new, self.curvature)
+        hidden_new = logmap0(hidden_new, curvature)
 
         #hidden_new  = self.act(self.W_h(message_agg)) # [n_node, dim]
         hidden_new  = hidden_new.clone()
+
+        # path token update in the shared hyperbolic space
+        path_parent = path_state[sub]
+        path_rel = expmap0(path_rel, curvature)
+        self_loop_mask = rel == (self.n_rel * 2)
+        if self_loop_mask.any():
+            path_rel = path_rel.clone()
+            path_rel[self_loop_mask] = 0.0
+
+        path_candidates = project(mobius_add(path_parent, path_rel, curvature), curvature)
+        query_path_edge = query_path_proto[r_idx]
+        path_logits = torch.log(alpha.squeeze(-1).clamp_min(MIN_NORM)) - lambda_q * hyp_distance(
+            path_candidates, query_path_edge, curvature, eval_mode=False
+        ).squeeze(-1)
+        path_weight_max = scatter(path_logits, index=obj, dim=0, dim_size=n_node, reduce='max')
+        path_weight_exp = torch.exp(path_logits - path_weight_max[obj])
+        path_weight_sum = scatter(path_weight_exp, index=obj, dim=0, dim_size=n_node, reduce='sum')
+        path_weights = path_weight_exp / path_weight_sum[obj].clamp_min(MIN_NORM)
+
+        path_candidates_tangent = logmap0(path_candidates, curvature)
+        path_state_new = expmap0(
+            scatter(path_weights.unsqueeze(-1) * path_candidates_tangent, index=obj, dim=0, dim_size=n_node, reduce='sum'),
+            curvature,
+        )
+        path_dispersion = scatter(
+            path_weights * hyp_distance(path_candidates, path_state_new[obj], curvature, eval_mode=False).squeeze(-1).pow(2),
+            index=obj,
+            dim=0,
+            dim_size=n_node,
+            reduce='sum',
+        )
         
         # forward without node sampling
         if self.n_node_topk <= 0:
-            return hidden_new
+            keep_mask = torch.ones(n_node, dtype=torch.bool, device=hidden_new.device)
+            return hidden_new, path_state_new, path_dispersion, nodes, keep_mask
 
         # forward with node sampling
         # indexing sampling operation
-        tmp_diff_node_idx = torch.ones(n_node)
+        tmp_diff_node_idx = torch.ones(n_node, device=hidden_new.device)
         tmp_diff_node_idx[old_nodes_new_idx] = 0
         bool_diff_node_idx = tmp_diff_node_idx.bool()
         diff_node = nodes[bool_diff_node_idx]
@@ -374,33 +403,51 @@ class GNNLayer(torch.nn.Module):
         # extract sampled nodes an their embeddings
         new_nodes  = nodes[bool_same_node_idx]
         hidden_new = hidden_new[bool_same_node_idx]
+        path_state_new = path_state_new[bool_same_node_idx]
+        path_dispersion = path_dispersion[bool_same_node_idx]
 
-        return hidden_new, new_nodes, bool_same_node_idx
+        return hidden_new, path_state_new, path_dispersion, new_nodes, bool_same_node_idx
 
 class GNNModel(torch.nn.Module):
     def __init__(self, params, loader):
         super(GNNModel, self).__init__()
         self.n_layer     = params.n_layer
         self.hidden_dim  = params.hidden_dim
+        self.d_path      = params.d_path
+        self.d_type      = params.d_type
         self.attn_dim    = params.attn_dim
         self.n_ent       = params.n_ent
         self.n_rel       = params.n_rel
         self.n_node_topk = params.n_node_topk
         self.n_edge_topk = params.n_edge_topk
         self.loader      = loader
+        self.lambda_q    = params.lambda_q
+        self.lambda_cal  = params.lambda_cal
+        self.beta_delta  = params.beta_delta
+        self.eta         = params.eta
+        self.b_g         = params.b_g
+        self.mu_p        = params.mu_p
+        self.mu_t        = params.mu_t
+        self.gamma_p     = params.gamma_p
+        self.gamma_t     = params.gamma_t
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act  = acts[params.act]
+        self.curvature = torch.nn.Parameter(torch.tensor(1.0))
 
         self.gnn_layers = []
         for i in range(self.n_layer):
             i_n_node_topk = self.n_node_topk if 'int' in str(type(self.n_node_topk)) else self.n_node_topk[i]
-            self.gnn_layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, self.n_ent, \
+            self.gnn_layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, self.n_ent, self.d_path, \
                                             n_node_topk=i_n_node_topk, n_edge_topk=self.n_edge_topk, tau=params.tau, act=act))
 
         self.gnn_layers = nn.ModuleList(self.gnn_layers)       
         self.dropout = nn.Dropout(params.dropout)
         self.W_final = nn.Linear(self.hidden_dim, 1, bias=False)
         self.gate    = nn.GRU(self.hidden_dim, self.hidden_dim)
+        self.path_rela_embed = nn.Embedding(2 * self.n_rel + 1, self.d_path)
+        self.path_prototypes = nn.Embedding(2 * self.n_rel, self.d_path)
+        self.type_prototypes = nn.Embedding(2 * self.n_rel, self.d_type)
+        self.W_type = nn.Linear(self.hidden_dim, self.d_type, bias=False)
 
     def updateTopkNums(self, topk_list):
         assert len(topk_list) == self.n_layer
@@ -413,13 +460,14 @@ class GNNModel(torch.nn.Module):
         for i in range(self.n_layer):
             self.gnn_layers[i].W_samp.apply(freeze)
 
-    def forward(self, subs, rels, mode='train'):
+    def forward(self, subs, rels, mode='train', return_details=False):
         n      = len(subs)                                                                # n == B (Batchsize)
         q_sub  = torch.LongTensor(subs).cuda()                                            # [B]
         q_rel  = torch.LongTensor(rels).cuda()                                            # [B]
         h0     = torch.zeros((1, n, self.hidden_dim)).cuda()                              # [1, B, dim]
         nodes  = torch.cat([torch.arange(n).unsqueeze(1).cuda(), q_sub.unsqueeze(1)], 1)  # [B, 2] with (batch_idx, node_idx)
         hidden = torch.zeros(n, self.hidden_dim).cuda()                                   # [B, dim]
+        path_state = torch.zeros(n, self.d_path).cuda()                                   # [B, d_path] hyperbolic origin
     
         for i in range(self.n_layer):
             # layers with sampling
@@ -428,10 +476,15 @@ class GNNModel(torch.nn.Module):
             # old_nodes_new_idx (of previous layer): [k1']
             nodes, edges, old_nodes_new_idx = self.loader.get_neighbors(nodes.data.cpu().numpy(), n, mode=mode)
             n_node  = nodes.size(0)
+            query_path_proto = expmap0(self.path_prototypes(q_rel), self.curvature)
+            path_rel = self.path_rela_embed(edges[:,2])
 
             # GNN forward -> get hidden representation at i-th layer
             # hidden: [k1, dim]
-            hidden, nodes, sampled_nodes_idx = self.gnn_layers[i](q_sub, q_rel, hidden, edges, nodes, old_nodes_new_idx, n)
+            hidden, path_state, path_dispersion, nodes, sampled_nodes_idx = self.gnn_layers[i](
+                q_sub, q_rel, hidden, path_state, edges, nodes, old_nodes_new_idx, n,
+                self.curvature, path_rel, query_path_proto, self.lambda_q
+            )
 
             # combine h0 and hi -> update hi with gate operation
             h0          = torch.zeros(1, n_node, hidden.size(1)).cuda().index_copy_(1, old_nodes_new_idx, h0)
@@ -442,10 +495,57 @@ class GNNModel(torch.nn.Module):
             
         # readout
         # [K, 2] (batch_idx, node_idx) K is w.r.t. n_nodes
-        scores     = self.W_final(hidden).squeeze(-1)                   
+        scores_base = self.W_final(hidden).squeeze(-1)
+        node_query_rel = q_rel[nodes[:,0]]
+        query_path_proto = expmap0(self.path_prototypes(node_query_rel), self.curvature)
+        path_scores = -hyp_distance(path_state, query_path_proto, self.curvature, eval_mode=False).squeeze(-1)
+        type_hidden = self.W_type(hidden)
+        type_scores = F.cosine_similarity(type_hidden, self.type_prototypes(node_query_rel), dim=-1)
+        gate = torch.sigmoid(self.b_g + self.eta * path_scores - self.beta_delta * path_dispersion)
+        calibrated_scores = gate * path_scores + (1 - gate) * type_scores
+        scores = scores_base + self.lambda_cal * calibrated_scores
         # non-visited entities have 0 scores
         scores_all = torch.zeros((n, self.loader.n_ent)).cuda()         
         # [B, n_all_nodes]
         scores_all[[nodes[:,0], nodes[:,1]]] = scores                   
-        
-        return scores_all
+        if not return_details:
+            return scores_all
+
+        return scores_all, {
+            'nodes': nodes,
+            'hidden': hidden,
+            'type_hidden': type_hidden,
+            'path_state': path_state,
+            'path_dispersion': path_dispersion,
+            'q_rel': q_rel,
+        }
+
+    def auxiliary_losses(self, details, rels, targets):
+        nodes = details['nodes']
+        hidden = details['hidden']
+        type_hidden = details['type_hidden']
+        path_state = details['path_state']
+        q_rel = torch.as_tensor(rels, dtype=torch.long, device=hidden.device)
+        targets = torch.as_tensor(targets, dtype=torch.long, device=hidden.device)
+        batch_size = q_rel.size(0)
+
+        node_lookup = torch.full((batch_size, self.n_ent), -1, dtype=torch.long, device=hidden.device)
+        node_lookup[nodes[:,0], nodes[:,1]] = torch.arange(nodes.size(0), device=hidden.device)
+        pos_idx = node_lookup[torch.arange(batch_size, device=hidden.device), targets]
+        valid_mask = pos_idx >= 0
+        if valid_mask.sum() <= 1:
+            zero = hidden.new_tensor(0.0)
+            return zero, zero
+
+        pos_idx = pos_idx[valid_mask]
+        rel_idx = q_rel[valid_mask]
+        pos_path = path_state[pos_idx]
+        pos_type = type_hidden[pos_idx]
+        query_path_proto = expmap0(self.path_prototypes(rel_idx), self.curvature)
+        type_proto = self.type_prototypes(rel_idx)
+
+        path_logits = -hyp_distance(query_path_proto, pos_path, self.curvature, eval_mode=True) / self.gamma_p
+        type_logits = (F.normalize(type_proto, dim=-1) @ F.normalize(pos_type, dim=-1).transpose(0, 1)) / self.gamma_t
+        labels = torch.arange(pos_idx.size(0), device=hidden.device)
+
+        return F.cross_entropy(path_logits, labels), F.cross_entropy(type_logits, labels)

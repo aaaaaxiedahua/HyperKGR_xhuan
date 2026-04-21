@@ -108,6 +108,8 @@ def parse_args():
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--topk', type=int, default=-1)
     parser.add_argument('--layers', type=int, default=-1)
+    parser.add_argument('--d_path', type=int, default=-1)
+    parser.add_argument('--d_type', type=int, default=-1)
     parser.add_argument('--tau', type=float, default=1.0)
     parser.add_argument('--scheduler', type=str, default='exp')
     parser.add_argument('--remove_1hop_edges', action='store_true')
@@ -120,6 +122,15 @@ def parse_args():
     parser.add_argument('--study_name', type=str, default=None)
     parser.add_argument('--storage', type=str, default=None)
     parser.add_argument('--weight', type=str, default=None)
+    parser.add_argument('--lambda_q', type=float, default=0.2)
+    parser.add_argument('--lambda_cal', type=float, default=0.5)
+    parser.add_argument('--beta_delta', type=float, default=1.0)
+    parser.add_argument('--eta', type=float, default=1.0)
+    parser.add_argument('--b_g', type=float, default=0.0)
+    parser.add_argument('--mu_p', type=float, default=0.1)
+    parser.add_argument('--mu_t', type=float, default=0.1)
+    parser.add_argument('--gamma_p', type=float, default=0.2)
+    parser.add_argument('--gamma_t', type=float, default=0.2)
     return parser.parse_args()
 
 
@@ -170,54 +181,40 @@ def apply_dataset_defaults(opts, dataset):
     opts.fact_ratio = base['fact_ratio']
     opts.n_batch = base['n_batch']
     opts.n_tbatch = base['n_tbatch']
+    opts.d_path = opts.hidden_dim if getattr(opts, 'd_path', -1) <= 0 else opts.d_path
+    opts.d_type = opts.hidden_dim if getattr(opts, 'd_type', -1) <= 0 else opts.d_type
+    opts.lambda_q = getattr(opts, 'lambda_q', 0.2)
+    opts.lambda_cal = getattr(opts, 'lambda_cal', 0.5)
+    opts.beta_delta = getattr(opts, 'beta_delta', 1.0)
+    opts.eta = getattr(opts, 'eta', 1.0)
+    opts.b_g = getattr(opts, 'b_g', 0.0)
+    opts.mu_p = getattr(opts, 'mu_p', 0.1)
+    opts.mu_t = getattr(opts, 'mu_t', 0.1)
+    opts.gamma_p = getattr(opts, 'gamma_p', 0.2)
+    opts.gamma_t = getattr(opts, 'gamma_t', 0.2)
     return base
 
 
-def build_layer_choices(base_layers):
-    return unique_preserve_order(
-        max(2, base_layers + offset)
-        for offset in [-2, -1, 0, 1, 2]
-    )
-
-
-def build_topk_search_space(base_topk):
-    step = max(10, int(round(base_topk * 0.1)))
-    min_topk = max(step, int(round(base_topk * 0.5 / step)) * step)
-    max_topk = min(1500, int(round(base_topk * 1.5 / step)) * step)
-    if max_topk <= min_topk:
-        max_topk = min_topk + step
-    return min_topk, max_topk, step
-
-
-def build_fact_ratio_search_space(base_ratio):
-    min_ratio = max(0.75, round(base_ratio - 0.10, 3))
-    max_ratio = min(0.995, round(base_ratio + 0.03, 3))
-    if max_ratio <= min_ratio:
-        max_ratio = min(0.995, round(min_ratio + 0.01, 3))
-    return min_ratio, max_ratio
-
-
 def build_search_space(dataset, base_cfg):
-    min_topk, max_topk, topk_step = build_topk_search_space(base_cfg['topk'])
-    min_ratio, max_ratio = build_fact_ratio_search_space(base_cfg['fact_ratio'])
     return {
-        'layers': build_layer_choices(base_cfg['layers']),
-        'topk': (min_topk, max_topk, topk_step),
-        'fact_ratio': (min_ratio, max_ratio, 0.005),
+        'layers': [4, 6, 8, 10],
+        'topk': [500, 750, 1000, 1250, 1500],
+        'fact_ratio': (0.90, 0.95, 0.01),
         'lr': (1e-4, 5e-2, True),
         'decay_rate': (0.90, 0.9999, False),
         'lamb': (1e-7, 1e-2, True),
         'hidden_dim': [32, 48, 64, 96, 128, 192, 256],
+        'd_path': [32, 64, 128],
+        'd_type': [32, 64, 128],
         'attn_dim': unique_preserve_order([base_cfg['attn_dim'], 2, 4, 5, 8, 16, 32, 64]),
         'dropout': (0.0, 0.5),
         'act': unique_preserve_order([base_cfg['act'], 'idd', 'relu', 'tanh']),
-        'shortcut_hops': [2, 3, 4],
-        'shortcut_topk': [4, 8, 12, 16],
-        'shortcut_decay': (0.3, 0.9, 0.1),
-        'shortcut_lambda': (0.05, 0.4),
-        'shortcut_candidate_cap': [16, 32, 64, 96, 128],
-        'd_hop': [16, 32, 48, 64, 96, 128],
-        'shortcut_prune_lambda': (0.0, 0.3),
+        'lambda_q': (0.0, 0.4),
+        'lambda_cal': (0.1, 0.8),
+        'beta_delta': (0.2, 2.0),
+        'eta': (0.2, 2.0),
+        'mu_p': (0.01, 0.2),
+        'mu_t': (0.01, 0.2),
     }
 
 
@@ -225,8 +222,7 @@ def suggest_hyperparams(trial, opts, dataset, base_cfg):
     search_space = build_search_space(dataset, base_cfg)
 
     opts.layers = trial.suggest_categorical('layers', search_space['layers'])
-    min_topk, max_topk, topk_step = search_space['topk']
-    opts.topk = trial.suggest_int('topk', min_topk, max_topk, step=topk_step)
+    opts.topk = trial.suggest_categorical('topk', search_space['topk'])
     min_ratio, max_ratio, ratio_step = search_space['fact_ratio']
     opts.fact_ratio = trial.suggest_float('fact_ratio', min_ratio, max_ratio, step=ratio_step)
     lr_min, lr_max, lr_log = search_space['lr']
@@ -236,20 +232,24 @@ def suggest_hyperparams(trial, opts, dataset, base_cfg):
     lamb_min, lamb_max, lamb_log = search_space['lamb']
     opts.lamb = trial.suggest_float('lamb', lamb_min, lamb_max, log=lamb_log)
     opts.hidden_dim = trial.suggest_categorical('hidden_dim', search_space['hidden_dim'])
+    opts.d_path = trial.suggest_categorical('d_path', search_space['d_path'])
+    opts.d_type = trial.suggest_categorical('d_type', search_space['d_type'])
     opts.attn_dim = trial.suggest_categorical('attn_dim', search_space['attn_dim'])
     dropout_min, dropout_max = search_space['dropout']
     opts.dropout = trial.suggest_float('dropout', dropout_min, dropout_max)
     opts.act = trial.suggest_categorical('act', search_space['act'])
-    opts.shortcut_hops = trial.suggest_categorical('shortcut_hops', search_space['shortcut_hops'])
-    opts.shortcut_topk = trial.suggest_categorical('shortcut_topk', search_space['shortcut_topk'])
-    sc_decay_min, sc_decay_max, sc_decay_step = search_space['shortcut_decay']
-    opts.shortcut_decay = trial.suggest_float('shortcut_decay', sc_decay_min, sc_decay_max, step=sc_decay_step)
-    sc_lam_min, sc_lam_max = search_space['shortcut_lambda']
-    opts.shortcut_lambda = trial.suggest_float('shortcut_lambda', sc_lam_min, sc_lam_max)
-    opts.shortcut_candidate_cap = trial.suggest_categorical('shortcut_candidate_cap', search_space['shortcut_candidate_cap'])
-    opts.d_hop = trial.suggest_categorical('d_hop', search_space['d_hop'])
-    sc_prune_min, sc_prune_max = search_space['shortcut_prune_lambda']
-    opts.shortcut_prune_lambda = trial.suggest_float('shortcut_prune_lambda', sc_prune_min, sc_prune_max)
+    lq_min, lq_max = search_space['lambda_q']
+    opts.lambda_q = trial.suggest_float('lambda_q', lq_min, lq_max)
+    lcal_min, lcal_max = search_space['lambda_cal']
+    opts.lambda_cal = trial.suggest_float('lambda_cal', lcal_min, lcal_max)
+    bd_min, bd_max = search_space['beta_delta']
+    opts.beta_delta = trial.suggest_float('beta_delta', bd_min, bd_max)
+    eta_min, eta_max = search_space['eta']
+    opts.eta = trial.suggest_float('eta', eta_min, eta_max)
+    mp_min, mp_max = search_space['mu_p']
+    opts.mu_p = trial.suggest_float('mu_p', mp_min, mp_max)
+    mt_min, mt_max = search_space['mu_t']
+    opts.mu_t = trial.suggest_float('mu_t', mt_min, mt_max)
     opts.n_edge_topk = -1
     opts.n_layer = opts.layers
     opts.n_node_topk = [opts.topk] * opts.layers
@@ -276,16 +276,17 @@ def summarize_trial_opts(opts):
         'decay_rate': opts.decay_rate,
         'lamb': opts.lamb,
         'hidden_dim': opts.hidden_dim,
+        'd_path': opts.d_path,
+        'd_type': opts.d_type,
         'attn_dim': opts.attn_dim,
         'dropout': opts.dropout,
         'act': opts.act,
-        'shortcut_hops': opts.shortcut_hops,
-        'shortcut_topk': opts.shortcut_topk,
-        'shortcut_decay': opts.shortcut_decay,
-        'shortcut_lambda': opts.shortcut_lambda,
-        'shortcut_candidate_cap': opts.shortcut_candidate_cap,
-        'd_hop': opts.d_hop,
-        'shortcut_prune_lambda': opts.shortcut_prune_lambda,
+        'lambda_q': opts.lambda_q,
+        'lambda_cal': opts.lambda_cal,
+        'beta_delta': opts.beta_delta,
+        'eta': opts.eta,
+        'mu_p': opts.mu_p,
+        'mu_t': opts.mu_t,
         'epoch': opts.epoch,
     }
 

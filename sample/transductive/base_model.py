@@ -63,11 +63,18 @@ class BaseModel(object):
         if layers != -1:
             extra_layers = self.model.gnn_layers[layers:]
             self.model.gnn_layers = self.model.gnn_layers[:layers]
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+            load_result = self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
             self.model.gnn_layers += extra_layers
         else:
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            load_result = self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            if 'optimizer_state_dict' in checkpoint:
+                try:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                except ValueError:
+                    print('==> optimizer state is incompatible with current model; skip loading optimizer state.')
+        if load_result.missing_keys or load_result.unexpected_keys:
+            print(f'==> missing keys: {load_result.missing_keys}')
+            print(f'==> unexpected keys: {load_result.unexpected_keys}')
 
     def train_batch(self,):
         epoch_loss = 0
@@ -84,11 +91,13 @@ class BaseModel(object):
             triple = self.loader.get_batch(batch_idx)
 
             self.model.zero_grad()
-            scores = self.model(triple[:,0], triple[:,1])
+            scores, details = self.model(triple[:,0], triple[:,1], return_details=True)
             pos_scores = scores[[torch.arange(len(scores)).cuda(), torch.LongTensor(triple[:,2]).cuda()]]
 
             max_n = torch.max(scores, 1, keepdim=True)[0]
-            loss = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1))) 
+            loss_rank = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1)))
+            loss_path, loss_type = self.model.auxiliary_losses(details, triple[:,1], triple[:,2])
+            loss = loss_rank + self.args.mu_p * loss_path + self.args.mu_t * loss_type
             loss.backward()
             self.optimizer.step()
 
