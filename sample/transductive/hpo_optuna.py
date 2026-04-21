@@ -149,6 +149,11 @@ def infer_dataset_name(data_path):
     return parts[-2]
 
 
+def study_name_safe(study_name, dataset):
+    value = study_name or f'{dataset}_optuna_hpo'
+    return value.replace('/', '_').replace('\\', '_').replace(':', '_').replace(' ', '_')
+
+
 def unique_preserve_order(items):
     seen = set()
     ordered = []
@@ -291,7 +296,7 @@ def summarize_trial_opts(opts):
     }
 
 
-def objective_factory(args, dataset, trial_log_path):
+def objective_factory(args, dataset, trial_log_path, checkpoint_dir):
     def objective(trial):
         set_seed(args.seed)
         opts = build_trial_opts(args, dataset, trial)
@@ -301,39 +306,65 @@ def objective_factory(args, dataset, trial_log_path):
         opts.n_rel = loader.n_rel
 
         model = BaseModel(opts, loader)
+        model.modelName = f'{study_name_safe(opts.study_name if hasattr(opts, "study_name") else None, dataset)}-trial{trial.number}'
         if opts.weight is not None:
             model.loadModel(opts.weight)
             model._update()
             model.model.updateTopkNums(opts.n_node_topk)
 
         best_v_mrr = float('-inf')
+        best_t_mrr = float('-inf')
         best_epoch = 0
         stale_rounds = 0
         trial_status = 'ok'
+        best_ckpt_path = None
         try:
             for epoch in range(opts.epoch):
                 model.train_batch()
                 if (epoch + 1) % opts.eval_interval != 0:
                     continue
 
-                result_dict, _ = model.evaluate(eval_val=True, eval_test=False, verbose=False)
+                result_dict, out_str = model.evaluate(eval_val=True, eval_test=True, verbose=False)
                 current_v_mrr = float(result_dict['v_mrr'])
+                current_t_mrr = float(result_dict['t_mrr'])
+                print(f'==> trial {trial.number} epoch {epoch + 1}: {out_str.strip()}')
 
                 if current_v_mrr > best_v_mrr:
                     best_v_mrr = current_v_mrr
+                    best_t_mrr = current_t_mrr
                     best_epoch = epoch + 1
                     stale_rounds = 0
+                    metric_str = f'ValMRR_{str(best_v_mrr)[:5]}_TestMRR_{str(best_t_mrr)[:5]}'
+                    ckpt_name = f'{study_name_safe(opts.study_name if hasattr(opts, "study_name") else None, dataset)}-trial{trial.number}-{metric_str}.pt'
+                    ckpt_path = os.path.join(checkpoint_dir, ckpt_name)
+                    torch.save(
+                        {
+                            'model_state_dict': model.model.state_dict(),
+                            'optimizer_state_dict': model.optimizer.state_dict(),
+                            'best_v_mrr': best_v_mrr,
+                            'best_t_mrr': best_t_mrr,
+                            'best_epoch': best_epoch,
+                            'trial': trial.number,
+                            'params': trial.params,
+                        },
+                        ckpt_path,
+                    )
+                    if best_ckpt_path is not None and best_ckpt_path != ckpt_path and os.path.exists(best_ckpt_path):
+                        os.remove(best_ckpt_path)
+                    best_ckpt_path = ckpt_path
                 else:
                     stale_rounds += 1
 
                 trial.report(best_v_mrr, epoch + 1)
                 if stale_rounds >= opts.early_stop_rounds:
+                    print(f'==> trial {trial.number} early stop at epoch {epoch + 1} after {stale_rounds} stale eval rounds.')
                     break
         except RuntimeError as exc:
             if 'out of memory' not in str(exc).lower():
                 raise
             trial_status = 'oom'
             best_v_mrr = 0.0
+            best_t_mrr = 0.0
             best_epoch = 0
             stale_rounds = opts.early_stop_rounds
             if torch.cuda.is_available():
@@ -341,10 +372,14 @@ def objective_factory(args, dataset, trial_log_path):
 
         if best_v_mrr == float('-inf'):
             best_v_mrr = 0.0
+        if best_t_mrr == float('-inf'):
+            best_t_mrr = -1.0
 
         trial.set_user_attr('best_epoch', best_epoch)
         trial.set_user_attr('stale_rounds', stale_rounds)
         trial.set_user_attr('status', trial_status)
+        trial.set_user_attr('best_t_mrr', best_t_mrr)
+        trial.set_user_attr('checkpoint_path', best_ckpt_path)
 
         append_jsonl(
             trial_log_path,
@@ -352,7 +387,9 @@ def objective_factory(args, dataset, trial_log_path):
                 'trial': trial.number,
                 'value': best_v_mrr,
                 'best_epoch': best_epoch,
+                'best_t_mrr': best_t_mrr,
                 'status': trial_status,
+                'checkpoint_path': best_ckpt_path,
                 'params': trial.params,
             },
         )
@@ -400,12 +437,15 @@ def main():
     args = parse_args()
     dataset = infer_dataset_name(args.data_path)
     study_name = args.study_name or f'{dataset}_optuna_hpo'
+    safe_study_name = study_name_safe(study_name, dataset)
 
     checkPath('./results/')
     checkPath(f'./results/{dataset}/')
 
     trial_log_path = f'./results/{dataset}/{study_name}_trials.jsonl'
     best_result_path = f'./results/{dataset}/{study_name}_best.json'
+    checkpoint_dir = f'./results/{dataset}/{safe_study_name}_checkpoints'
+    checkPath(checkpoint_dir)
 
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
@@ -427,7 +467,7 @@ def main():
         load_if_exists=True,
     )
 
-    objective = objective_factory(args, dataset, trial_log_path)
+    objective = objective_factory(args, dataset, trial_log_path, checkpoint_dir)
     callbacks = [StudyEarlyStopCallback(args.study_early_stop_rounds)]
     study.optimize(objective, n_trials=args.n_trials, gc_after_trial=True, callbacks=callbacks)
 
