@@ -324,7 +324,7 @@ def objective_factory(args, dataset, trial_log_path, checkpoint_dir):
                 if (epoch + 1) % opts.eval_interval != 0:
                     continue
 
-                result_dict, out_str = model.evaluate(eval_val=True, eval_test=True, verbose=False)
+                result_dict, out_str = model.evaluate(eval_val=True, eval_test=True, verbose=True)
                 current_v_mrr = float(result_dict['v_mrr'])
                 current_t_mrr = float(result_dict['t_mrr'])
                 print(f'==> trial {trial.number} epoch {epoch + 1}: {out_str.strip()}')
