@@ -308,31 +308,42 @@ def objective_factory(args, dataset, trial_log_path):
         best_v_mrr = float('-inf')
         best_epoch = 0
         stale_rounds = 0
+        trial_status = 'ok'
+        try:
+            for epoch in range(opts.epoch):
+                model.train_batch()
+                if (epoch + 1) % opts.eval_interval != 0:
+                    continue
 
-        for epoch in range(opts.epoch):
-            model.train_batch()
-            if (epoch + 1) % opts.eval_interval != 0:
-                continue
+                result_dict, _ = model.evaluate(eval_val=True, eval_test=False, verbose=False)
+                current_v_mrr = float(result_dict['v_mrr'])
 
-            result_dict, _ = model.evaluate(eval_val=True, eval_test=False, verbose=False)
-            current_v_mrr = float(result_dict['v_mrr'])
+                if current_v_mrr > best_v_mrr:
+                    best_v_mrr = current_v_mrr
+                    best_epoch = epoch + 1
+                    stale_rounds = 0
+                else:
+                    stale_rounds += 1
 
-            if current_v_mrr > best_v_mrr:
-                best_v_mrr = current_v_mrr
-                best_epoch = epoch + 1
-                stale_rounds = 0
-            else:
-                stale_rounds += 1
-
-            trial.report(best_v_mrr, epoch + 1)
-            if stale_rounds >= opts.early_stop_rounds:
-                break
+                trial.report(best_v_mrr, epoch + 1)
+                if stale_rounds >= opts.early_stop_rounds:
+                    break
+        except RuntimeError as exc:
+            if 'out of memory' not in str(exc).lower():
+                raise
+            trial_status = 'oom'
+            best_v_mrr = 0.0
+            best_epoch = 0
+            stale_rounds = opts.early_stop_rounds
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         if best_v_mrr == float('-inf'):
             best_v_mrr = 0.0
 
         trial.set_user_attr('best_epoch', best_epoch)
         trial.set_user_attr('stale_rounds', stale_rounds)
+        trial.set_user_attr('status', trial_status)
 
         append_jsonl(
             trial_log_path,
@@ -340,6 +351,7 @@ def objective_factory(args, dataset, trial_log_path):
                 'trial': trial.number,
                 'value': best_v_mrr,
                 'best_epoch': best_epoch,
+                'status': trial_status,
                 'params': trial.params,
             },
         )

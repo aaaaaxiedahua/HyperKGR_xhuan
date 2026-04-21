@@ -35,17 +35,6 @@ class BaseModel(object):
         for i in range(args.n_layer):
             i_n_node_topk = args.n_node_topk if 'int' in str(type(args.n_node_topk)) else args.n_node_topk[i]
             self.modelName += f'-{i_n_node_topk}'
-        shortcut_hops = getattr(args, 'shortcut_hops', 1)
-        shortcut_topk = getattr(args, 'shortcut_topk', 0)
-        shortcut_lambda = getattr(args, 'shortcut_lambda', 0.0)
-        if shortcut_hops >= 2 and shortcut_topk > 0 and shortcut_lambda > 0:
-            shortcut_decay = getattr(args, 'shortcut_decay', 0.5)
-            shortcut_cap = getattr(args, 'shortcut_candidate_cap', 64)
-            d_hop = getattr(args, 'd_hop', args.hidden_dim)
-            shortcut_prune_lambda = getattr(args, 'shortcut_prune_lambda', shortcut_lambda)
-            if shortcut_prune_lambda < 0:
-                shortcut_prune_lambda = shortcut_lambda
-            self.modelName += f'-sh{shortcut_hops}-stk{shortcut_topk}-sdec{shortcut_decay:.2f}-slam{shortcut_lambda:.2f}-scap{shortcut_cap}-dh{d_hop}-splam{shortcut_prune_lambda:.2f}'
         print(f'==> model name: {self.modelName}')
 
     def _update(self):
