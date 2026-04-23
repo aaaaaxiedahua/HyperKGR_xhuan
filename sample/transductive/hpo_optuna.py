@@ -127,9 +127,7 @@ def parse_args():
     parser.add_argument('--beta_delta', type=float, default=1.0)
     parser.add_argument('--eta', type=float, default=1.0)
     parser.add_argument('--b_g', type=float, default=0.0)
-    parser.add_argument('--mu_p', type=float, default=0.1)
     parser.add_argument('--mu_t', type=float, default=0.1)
-    parser.add_argument('--gamma_p', type=float, default=0.2)
     parser.add_argument('--gamma_t', type=float, default=0.2)
     return parser.parse_args()
 
@@ -193,9 +191,7 @@ def apply_dataset_defaults(opts, dataset):
     opts.beta_delta = getattr(opts, 'beta_delta', 1.0)
     opts.eta = getattr(opts, 'eta', 1.0)
     opts.b_g = getattr(opts, 'b_g', 0.0)
-    opts.mu_p = getattr(opts, 'mu_p', 0.1)
     opts.mu_t = getattr(opts, 'mu_t', 0.1)
-    opts.gamma_p = getattr(opts, 'gamma_p', 0.2)
     opts.gamma_t = getattr(opts, 'gamma_t', 0.2)
     return base
 
@@ -205,7 +201,7 @@ def build_search_space(dataset, base_cfg):
         'layers': [4, 6, 8, 10],
         'topk': [500, 750, 1000, 1250, 1500],
         'fact_ratio': (0.90, 0.95, 0.01),
-        'lr': (1e-4, 5e-2, True),
+        'lr': (1e-4, 1e-2, True),
         'decay_rate': (0.90, 0.9999, False),
         'lamb': (1e-7, 1e-2, True),
         'hidden_dim': [32, 48, 64, 96, 128, 192, 256],
@@ -218,7 +214,6 @@ def build_search_space(dataset, base_cfg):
         'lambda_cal': (0.1, 0.8),
         'beta_delta': (0.2, 2.0),
         'eta': (0.2, 2.0),
-        'mu_p': (0.01, 0.2),
         'mu_t': (0.01, 0.2),
     }
 
@@ -251,8 +246,6 @@ def suggest_hyperparams(trial, opts, dataset, base_cfg):
     opts.beta_delta = trial.suggest_float('beta_delta', bd_min, bd_max)
     eta_min, eta_max = search_space['eta']
     opts.eta = trial.suggest_float('eta', eta_min, eta_max)
-    mp_min, mp_max = search_space['mu_p']
-    opts.mu_p = trial.suggest_float('mu_p', mp_min, mp_max)
     mt_min, mt_max = search_space['mu_t']
     opts.mu_t = trial.suggest_float('mu_t', mt_min, mt_max)
     opts.n_edge_topk = -1
@@ -290,7 +283,6 @@ def summarize_trial_opts(opts):
         'lambda_cal': opts.lambda_cal,
         'beta_delta': opts.beta_delta,
         'eta': opts.eta,
-        'mu_p': opts.mu_p,
         'mu_t': opts.mu_t,
         'epoch': opts.epoch,
     }
@@ -324,7 +316,7 @@ def objective_factory(args, dataset, trial_log_path, checkpoint_dir):
                 if (epoch + 1) % opts.eval_interval != 0:
                     continue
 
-                result_dict, out_str = model.evaluate(eval_val=True, eval_test=True, verbose=True)
+                result_dict, out_str = model.evaluate(eval_val=True, eval_test=True, verbose=False)
                 current_v_mrr = float(result_dict['v_mrr'])
                 current_t_mrr = float(result_dict['t_mrr'])
                 print(f'==> trial {trial.number} epoch {epoch + 1}: {out_str.strip()}')

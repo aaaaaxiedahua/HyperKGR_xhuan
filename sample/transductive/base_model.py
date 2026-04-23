@@ -96,17 +96,21 @@ class BaseModel(object):
 
             max_n = torch.max(scores, 1, keepdim=True)[0]
             loss_rank = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1)))
-            loss_path, loss_type = self.model.auxiliary_losses(details, triple[:,1], triple[:,2])
-            loss = loss_rank + self.args.mu_p * loss_path + self.args.mu_t * loss_type
+            loss_type = self.model.auxiliary_losses(details, triple[:,1], triple[:,2])
+            if not torch.isfinite(loss_type):
+                loss_type = loss_rank.new_tensor(0.0)
+            loss = loss_rank + self.args.mu_t * loss_type
+            if not torch.isfinite(loss):
+                print(f'==> skip non-finite training batch at step {i}: rank={loss_rank.item() if torch.isfinite(loss_rank) else "nan"}, type={loss_type.item() if torch.isfinite(loss_type) else "nan"}')
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
             self.optimizer.step()
 
-            # avoid NaN
+            # avoid NaN / Inf
             for p in self.model.parameters():
-                X = p.data.clone()
-                flag = X != X
-                X[flag] = np.random.random()
-                p.data.copy_(X)
+                p.data.copy_(torch.nan_to_num(p.data, nan=0.0, posinf=1.0, neginf=-1.0))
             epoch_loss += loss.item()
 
         self.t_time += time.time() - t_time
@@ -137,6 +141,7 @@ class BaseModel(object):
                 batch_idx = np.arange(start, end)
                 subs, rels, objs = self.loader.get_batch(batch_idx, data='valid')
                 scores = self.model(subs, rels, mode='valid')
+                scores = torch.nan_to_num(scores, nan=-1e6, posinf=1e6, neginf=-1e6)
                 scores = scores.data.cpu().numpy()
 
                 filters = []
@@ -170,6 +175,7 @@ class BaseModel(object):
                 batch_idx = np.arange(start, end)
                 subs, rels, objs = self.loader.get_batch(batch_idx, data='test')
                 scores = self.model(subs, rels, mode='test')
+                scores = torch.nan_to_num(scores, nan=-1e6, posinf=1e6, neginf=-1e6)
                 scores = scores.data.cpu().numpy()
 
                 filters = []

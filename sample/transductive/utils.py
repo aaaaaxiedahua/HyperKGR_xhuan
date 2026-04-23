@@ -8,6 +8,7 @@ def checkPath(path):
     return
 
 def cal_ranks(scores, labels, filters):
+    scores = np.nan_to_num(scores, nan=-1e6, posinf=1e6, neginf=-1e6)
     scores = scores - np.min(scores, axis=1, keepdims=True) + 1e-8
     full_rank = rankdata(-scores, method='average', axis=1)
     filter_scores = scores * filters
@@ -17,6 +18,12 @@ def cal_ranks(scores, labels, filters):
     return list(ranks)
 
 def cal_performance(ranks):
+    if len(ranks) == 0:
+        return 0.0, 0.0, 0.0
+    ranks = np.asarray(ranks)
+    ranks = ranks[np.isfinite(ranks)]
+    if len(ranks) == 0:
+        return 0.0, 0.0, 0.0
     mrr = (1. / ranks).sum() / len(ranks)
     h_1 = sum(ranks<=1) * 1.0 / len(ranks)
     h_10 = sum(ranks<=10) * 1.0 / len(ranks)

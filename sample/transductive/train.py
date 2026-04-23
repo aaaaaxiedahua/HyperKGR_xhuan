@@ -34,9 +34,7 @@ parser.add_argument('--lambda_cal', type=float, default=0.5)
 parser.add_argument('--beta_delta', type=float, default=1.0)
 parser.add_argument('--eta', type=float, default=1.0)
 parser.add_argument('--b_g', type=float, default=0.0)
-parser.add_argument('--mu_p', type=float, default=0.1)
 parser.add_argument('--mu_t', type=float, default=0.1)
-parser.add_argument('--gamma_p', type=float, default=0.2)
 parser.add_argument('--gamma_t', type=float, default=0.2)
 args = parser.parse_args()
 
@@ -158,8 +156,8 @@ if __name__ == '__main__':
         f.write(
             f'd_path={opts.d_path}, d_type={opts.d_type}, '
             f'lambda_q={opts.lambda_q:.4f}, lambda_cal={opts.lambda_cal:.4f}, beta_delta={opts.beta_delta:.4f}, '
-            f'eta={opts.eta:.4f}, b_g={opts.b_g:.4f}, mu_p={opts.mu_p:.4f}, mu_t={opts.mu_t:.4f}, '
-            f'gamma_p={opts.gamma_p:.4f}, gamma_t={opts.gamma_t:.4f}\n'
+            f'eta={opts.eta:.4f}, b_g={opts.b_g:.4f}, mu_t={opts.mu_t:.4f}, '
+            f'gamma_t={opts.gamma_t:.4f}\n'
         )
 
     if args.weight != None:

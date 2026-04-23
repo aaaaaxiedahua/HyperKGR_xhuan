@@ -82,6 +82,15 @@ import torch
 
 MIN_NORM = 1e-15
 BALL_EPS = {torch.float32: 4e-3, torch.float64: 1e-5}
+MAX_DISTANCE = 1e6
+MAX_LOGIT = 50.0
+
+
+def sanitize_tensor(x, nan=0.0, posinf=MAX_DISTANCE, neginf=-MAX_DISTANCE, min_value=None, max_value=None):
+    x = torch.nan_to_num(x, nan=nan, posinf=posinf, neginf=neginf)
+    if min_value is not None or max_value is not None:
+        x = torch.clamp(x, min=min_value, max=max_value)
+    return x
 
 
 # ################# MATH FUNCTIONS ########################
@@ -125,7 +134,7 @@ def expmap0(u, c=1):
     sqrt_c = c ** 0.5
     u_norm = u.norm(dim=-1, p=2, keepdim=True).clamp_min(MIN_NORM)
     gamma_1 = tanh(sqrt_c * u_norm) * u / (sqrt_c * u_norm)
-    return project(gamma_1, c)
+    return project(sanitize_tensor(gamma_1), c)
 
 
 def logmap0(y, c):
@@ -141,7 +150,8 @@ def logmap0(y, c):
     c = safe_curvature(c)
     sqrt_c = c ** 0.5
     y_norm = y.norm(dim=-1, p=2, keepdim=True).clamp_min(MIN_NORM)
-    return y / y_norm / sqrt_c * artanh(sqrt_c * y_norm)
+    result = y / y_norm / sqrt_c * artanh((sqrt_c * y_norm).clamp_max(1 - BALL_EPS[y.dtype]))
+    return sanitize_tensor(result)
 
 
 def project(x, c):
@@ -155,12 +165,13 @@ def project(x, c):
         torch.Tensor with projected hyperbolic points.
     """
     c = safe_curvature(c)
+    x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     norm = x.norm(dim=-1, p=2, keepdim=True).clamp_min(MIN_NORM)
     eps = BALL_EPS[x.dtype]
     maxnorm = (1 - eps) / (c ** 0.5)
     cond = norm > maxnorm
     projected = x / norm * maxnorm
-    return torch.where(cond, projected, x)
+    return sanitize_tensor(torch.where(cond, projected, x), nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def mobius_add(x, y, c):
@@ -180,7 +191,7 @@ def mobius_add(x, y, c):
     xy = torch.sum(x * y, dim=-1, keepdim=True)
     num = (1 + 2 * c * xy + c * y2) * x + (1 - c * x2) * y
     denom = 1 + 2 * c * xy + c ** 2 * x2 * y2
-    return num / denom.clamp_min(MIN_NORM)
+    return project(sanitize_tensor(num / denom.clamp_min(MIN_NORM)), c)
 
 
 # ################# HYP DISTANCES ########################
@@ -207,11 +218,14 @@ def hyp_distance(x, y, c, eval_mode=False):
         xy = torch.sum(x * y, dim=-1, keepdim=True)
     c1 = 1 - 2 * c * xy + c * y2
     c2 = 1 - c * x2
-    num = torch.sqrt((c1 ** 2) * x2 + (c2 ** 2) * y2 - (2 * c1 * c2) * xy)
+    radicand = (c1 ** 2) * x2 + (c2 ** 2) * y2 - (2 * c1 * c2) * xy
+    num = torch.sqrt(radicand.clamp_min(0.0))
     denom = 1 - 2 * c * xy + c ** 2 * x2 * y2
-    pairwise_norm = num / denom.clamp_min(MIN_NORM)
-    dist = artanh(sqrt_c * pairwise_norm)
-    return 2 * dist / sqrt_c
+    pairwise_norm = sanitize_tensor(num / denom.clamp_min(MIN_NORM), nan=0.0, posinf=MAX_DISTANCE, neginf=0.0, min_value=0.0)
+    max_norm = (1 - BALL_EPS[x.dtype]) / sqrt_c.clamp_min(MIN_NORM)
+    pairwise_norm = torch.minimum(pairwise_norm, max_norm)
+    dist = artanh((sqrt_c * pairwise_norm).clamp_max(1 - BALL_EPS[x.dtype]))
+    return sanitize_tensor(2 * dist / sqrt_c, nan=0.0, posinf=MAX_DISTANCE, neginf=0.0, min_value=0.0, max_value=MAX_DISTANCE)
 
 
 def hyp_distance_multi_c(x, v, c, eval_mode=False):
@@ -331,36 +345,41 @@ class GNNLayer(torch.nn.Module):
         #hidden_new  = self.act(self.W_h(message_agg)) # [n_node, dim]
         hidden_new  = hidden_new.clone()
 
-        # path token update in the shared hyperbolic space
+        # Tangent-space path token update: consensus is built in Euclidean space,
+        # then only the final readout will map it into the hyperbolic space.
         path_parent = path_state[sub]
-        path_rel = expmap0(path_rel, curvature)
         self_loop_mask = rel == (self.n_rel * 2)
         if self_loop_mask.any():
             path_rel = path_rel.clone()
             path_rel[self_loop_mask] = 0.0
 
-        path_candidates = project(mobius_add(path_parent, path_rel, curvature), curvature)
+        path_candidates = sanitize_tensor(path_parent + path_rel, nan=0.0)
         query_path_edge = query_path_proto[r_idx]
-        path_logits = torch.log(alpha.squeeze(-1).clamp_min(MIN_NORM)) - lambda_q * hyp_distance(
-            path_candidates, query_path_edge, curvature, eval_mode=False
-        ).squeeze(-1)
+        path_query_sim = F.cosine_similarity(path_candidates, query_path_edge, dim=-1)
+        path_logits = torch.log(alpha.squeeze(-1).clamp_min(MIN_NORM)) + lambda_q * path_query_sim
+        path_logits = sanitize_tensor(path_logits, nan=-MAX_LOGIT, posinf=MAX_LOGIT, neginf=-MAX_LOGIT, min_value=-MAX_LOGIT, max_value=MAX_LOGIT)
         path_weight_max = scatter(path_logits, index=obj, dim=0, dim_size=n_node, reduce='max')
         path_weight_exp = torch.exp(path_logits - path_weight_max[obj])
         path_weight_sum = scatter(path_weight_exp, index=obj, dim=0, dim_size=n_node, reduce='sum')
         path_weights = path_weight_exp / path_weight_sum[obj].clamp_min(MIN_NORM)
+        path_weights = sanitize_tensor(path_weights, nan=0.0, posinf=1.0, neginf=0.0)
 
-        path_candidates_tangent = logmap0(path_candidates, curvature)
-        path_state_new = expmap0(
-            scatter(path_weights.unsqueeze(-1) * path_candidates_tangent, index=obj, dim=0, dim_size=n_node, reduce='sum'),
-            curvature,
-        )
-        path_dispersion = scatter(
-            path_weights * hyp_distance(path_candidates, path_state_new[obj], curvature, eval_mode=False).squeeze(-1).pow(2),
+        path_state_new = scatter(
+            path_weights.unsqueeze(-1) * path_candidates,
             index=obj,
             dim=0,
             dim_size=n_node,
             reduce='sum',
         )
+        path_dispersion = scatter(
+            path_weights * (path_candidates - path_state_new[obj]).pow(2).sum(dim=-1),
+            index=obj,
+            dim=0,
+            dim_size=n_node,
+            reduce='sum',
+        )
+        path_state_new = sanitize_tensor(path_state_new, nan=0.0)
+        path_dispersion = sanitize_tensor(path_dispersion, nan=0.0, posinf=MAX_DISTANCE, neginf=0.0, min_value=0.0, max_value=MAX_DISTANCE)
         
         # forward without node sampling
         if self.n_node_topk <= 0:
@@ -426,9 +445,7 @@ class GNNModel(torch.nn.Module):
         self.beta_delta  = params.beta_delta
         self.eta         = params.eta
         self.b_g         = params.b_g
-        self.mu_p        = params.mu_p
         self.mu_t        = params.mu_t
-        self.gamma_p     = params.gamma_p
         self.gamma_t     = params.gamma_t
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act  = acts[params.act]
@@ -447,6 +464,7 @@ class GNNModel(torch.nn.Module):
         self.path_rela_embed = nn.Embedding(2 * self.n_rel + 1, self.d_path)
         self.path_prototypes = nn.Embedding(2 * self.n_rel, self.d_path)
         self.type_prototypes = nn.Embedding(2 * self.n_rel, self.d_type)
+        self.W_path = nn.Linear(self.d_path, self.d_path, bias=False)
         self.W_type = nn.Linear(self.hidden_dim, self.d_type, bias=False)
 
     def updateTopkNums(self, topk_list):
@@ -467,7 +485,7 @@ class GNNModel(torch.nn.Module):
         h0     = torch.zeros((1, n, self.hidden_dim)).cuda()                              # [1, B, dim]
         nodes  = torch.cat([torch.arange(n).unsqueeze(1).cuda(), q_sub.unsqueeze(1)], 1)  # [B, 2] with (batch_idx, node_idx)
         hidden = torch.zeros(n, self.hidden_dim).cuda()                                   # [B, dim]
-        path_state = torch.zeros(n, self.d_path).cuda()                                   # [B, d_path] hyperbolic origin
+        path_state = torch.zeros(n, self.d_path).cuda()                                   # [B, d_path] tangent-space path token
     
         for i in range(self.n_layer):
             # layers with sampling
@@ -476,7 +494,7 @@ class GNNModel(torch.nn.Module):
             # old_nodes_new_idx (of previous layer): [k1']
             nodes, edges, old_nodes_new_idx = self.loader.get_neighbors(nodes.data.cpu().numpy(), n, mode=mode)
             n_node  = nodes.size(0)
-            query_path_proto = expmap0(self.path_prototypes(q_rel), self.curvature)
+            query_path_proto = self.path_prototypes(q_rel)
             path_rel = self.path_rela_embed(edges[:,2])
 
             # GNN forward -> get hidden representation at i-th layer
@@ -495,15 +513,19 @@ class GNNModel(torch.nn.Module):
             
         # readout
         # [K, 2] (batch_idx, node_idx) K is w.r.t. n_nodes
-        scores_base = self.W_final(hidden).squeeze(-1)
+        scores_base = sanitize_tensor(self.W_final(hidden).squeeze(-1), nan=0.0)
         node_query_rel = q_rel[nodes[:,0]]
-        query_path_proto = expmap0(self.path_prototypes(node_query_rel), self.curvature)
-        path_scores = -hyp_distance(path_state, query_path_proto, self.curvature, eval_mode=False).squeeze(-1)
-        type_hidden = self.W_type(hidden)
+        path_state_h = expmap0(self.W_path(path_state), self.curvature)
+        query_path_proto = expmap0(self.W_path(self.path_prototypes(node_query_rel)), self.curvature)
+        path_scores = -hyp_distance(path_state_h, query_path_proto, self.curvature, eval_mode=False).squeeze(-1) / max(self.eta, 1e-6)
+        path_scores = sanitize_tensor(path_scores, nan=-MAX_DISTANCE, posinf=0.0, neginf=-MAX_DISTANCE, min_value=-MAX_DISTANCE, max_value=0.0)
+        type_hidden = sanitize_tensor(self.W_type(hidden), nan=0.0)
         type_scores = F.cosine_similarity(type_hidden, self.type_prototypes(node_query_rel), dim=-1)
-        gate = torch.sigmoid(self.b_g + self.eta * path_scores - self.beta_delta * path_dispersion)
-        calibrated_scores = gate * path_scores + (1 - gate) * type_scores
-        scores = scores_base + self.lambda_cal * calibrated_scores
+        type_scores = sanitize_tensor(type_scores, nan=0.0, posinf=1.0, neginf=-1.0, min_value=-1.0, max_value=1.0)
+        gate = torch.sigmoid(self.b_g - self.beta_delta * path_dispersion)
+        gate = sanitize_tensor(gate, nan=0.5, posinf=1.0, neginf=0.0, min_value=0.0, max_value=1.0)
+        calibrated_scores = sanitize_tensor(gate * path_scores + (1 - gate) * type_scores, nan=0.0)
+        scores = sanitize_tensor(scores_base + self.lambda_cal * calibrated_scores, nan=-MAX_DISTANCE)
         # non-visited entities have 0 scores
         scores_all = torch.zeros((n, self.loader.n_ent)).cuda()         
         # [B, n_all_nodes]
@@ -516,6 +538,7 @@ class GNNModel(torch.nn.Module):
             'hidden': hidden,
             'type_hidden': type_hidden,
             'path_state': path_state,
+            'path_state_h': path_state_h,
             'path_dispersion': path_dispersion,
             'q_rel': q_rel,
         }
@@ -524,7 +547,6 @@ class GNNModel(torch.nn.Module):
         nodes = details['nodes']
         hidden = details['hidden']
         type_hidden = details['type_hidden']
-        path_state = details['path_state']
         q_rel = torch.as_tensor(rels, dtype=torch.long, device=hidden.device)
         targets = torch.as_tensor(targets, dtype=torch.long, device=hidden.device)
         batch_size = q_rel.size(0)
@@ -534,18 +556,13 @@ class GNNModel(torch.nn.Module):
         pos_idx = node_lookup[torch.arange(batch_size, device=hidden.device), targets]
         valid_mask = pos_idx >= 0
         if valid_mask.sum() <= 1:
-            zero = hidden.new_tensor(0.0)
-            return zero, zero
+            return hidden.new_tensor(0.0)
 
         pos_idx = pos_idx[valid_mask]
         rel_idx = q_rel[valid_mask]
-        pos_path = path_state[pos_idx]
         pos_type = type_hidden[pos_idx]
-        query_path_proto = expmap0(self.path_prototypes(rel_idx), self.curvature)
         type_proto = self.type_prototypes(rel_idx)
-
-        path_logits = -hyp_distance(query_path_proto, pos_path, self.curvature, eval_mode=True) / self.gamma_p
-        type_logits = (F.normalize(type_proto, dim=-1) @ F.normalize(pos_type, dim=-1).transpose(0, 1)) / self.gamma_t
+        type_logits = (F.normalize(type_proto, dim=-1) @ F.normalize(pos_type, dim=-1).transpose(0, 1)) / max(self.gamma_t, 1e-6)
+        type_logits = sanitize_tensor(type_logits, nan=0.0, posinf=MAX_LOGIT, neginf=-MAX_LOGIT, min_value=-MAX_LOGIT, max_value=MAX_LOGIT)
         labels = torch.arange(pos_idx.size(0), device=hidden.device)
-
-        return F.cross_entropy(path_logits, labels), F.cross_entropy(type_logits, labels)
+        return F.cross_entropy(type_logits, labels)
