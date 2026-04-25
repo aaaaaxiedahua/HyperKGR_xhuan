@@ -14,7 +14,7 @@ parser.add_argument('--seed', type=int, default=1234)
 parser.add_argument('--gpu', type=int, default=-1)
 parser.add_argument('--topk', type=int, default=-1)
 parser.add_argument('--layers', type=int, default=-1)
-parser.add_argument('--d_path', type=int, default=-1)
+parser.add_argument('--d_rule', type=int, default=32)
 parser.add_argument('--d_type', type=int, default=-1)
 parser.add_argument('--sampling', type=str, default='incremental')
 parser.add_argument('--weight', type=str, default=None)
@@ -29,11 +29,11 @@ parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--fact_ratio', type=float, default=0.9)
 parser.add_argument('--epoch', type=int, default=300)
 parser.add_argument('--eval_interval', type=int, default=1)
-parser.add_argument('--lambda_q', type=float, default=0.2)
-parser.add_argument('--lambda_cal', type=float, default=0.5)
-parser.add_argument('--beta_delta', type=float, default=1.0)
-parser.add_argument('--eta', type=float, default=1.0)
-parser.add_argument('--b_g', type=float, default=0.0)
+parser.add_argument('--lambda_rule', type=float, default=0.2)
+parser.add_argument('--lambda_keep', type=float, default=0.2)
+parser.add_argument('--lambda_rule_final', type=float, default=0.2)
+parser.add_argument('--lambda_type', type=float, default=0.5)
+parser.add_argument('--beta_u', type=float, default=0.05)
 parser.add_argument('--mu_t', type=float, default=0.1)
 parser.add_argument('--gamma_t', type=float, default=0.2)
 args = parser.parse_args()
@@ -135,8 +135,8 @@ if __name__ == '__main__':
         opts.n_layer = opts.layers
         opts.n_batch = opts.n_tbatch = 5
 
-    if opts.d_path <= 0:
-        opts.d_path = opts.hidden_dim
+    if opts.d_rule <= 0:
+        opts.d_rule = 32
     if opts.d_type <= 0:
         opts.d_type = opts.hidden_dim
     
@@ -154,9 +154,10 @@ if __name__ == '__main__':
     with open(opts.perf_file, 'a+') as f:
         f.write(config_str)  
         f.write(
-            f'd_path={opts.d_path}, d_type={opts.d_type}, '
-            f'lambda_q={opts.lambda_q:.4f}, lambda_cal={opts.lambda_cal:.4f}, beta_delta={opts.beta_delta:.4f}, '
-            f'eta={opts.eta:.4f}, b_g={opts.b_g:.4f}, mu_t={opts.mu_t:.4f}, '
+            f'd_rule={opts.d_rule}, d_type={opts.d_type}, '
+            f'lambda_rule={opts.lambda_rule:.4f}, lambda_keep={opts.lambda_keep:.4f}, '
+            f'lambda_rule_final={opts.lambda_rule_final:.4f}, lambda_type={opts.lambda_type:.4f}, '
+            f'beta_u={opts.beta_u:.4f}, mu_t={opts.mu_t:.4f}, '
             f'gamma_t={opts.gamma_t:.4f}\n'
         )
 

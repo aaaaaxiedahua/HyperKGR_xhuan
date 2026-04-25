@@ -140,7 +140,8 @@ class BaseModel(object):
                 end = min(n_data, (i+1)*batch_size)
                 batch_idx = np.arange(start, end)
                 subs, rels, objs = self.loader.get_batch(batch_idx, data='valid')
-                scores = self.model(subs, rels, mode='valid')
+                with torch.no_grad():
+                    scores = self.model(subs, rels, mode='valid')
                 scores = torch.nan_to_num(scores, nan=-1e6, posinf=1e6, neginf=-1e6)
                 scores = scores.data.cpu().numpy()
 
@@ -174,7 +175,8 @@ class BaseModel(object):
                 end = min(n_data, (i+1)*batch_size)
                 batch_idx = np.arange(start, end)
                 subs, rels, objs = self.loader.get_batch(batch_idx, data='test')
-                scores = self.model(subs, rels, mode='test')
+                with torch.no_grad():
+                    scores = self.model(subs, rels, mode='test')
                 scores = torch.nan_to_num(scores, nan=-1e6, posinf=1e6, neginf=-1e6)
                 scores = scores.data.cpu().numpy()
 
