@@ -118,7 +118,6 @@ def parse_args():
     parser.add_argument('--eval_interval', type=int, default=1)
     parser.add_argument('--n_trials', type=int, default=20)
     parser.add_argument('--early_stop_rounds', type=int, default=3)
-    parser.add_argument('--study_early_stop_rounds', type=int, default=3)
     parser.add_argument('--study_name', type=str, default=None)
     parser.add_argument('--storage', type=str, default=None)
     parser.add_argument('--weight', type=str, default=None)
@@ -199,12 +198,12 @@ def apply_dataset_defaults(opts, dataset):
 def build_search_space(dataset, base_cfg):
     return {
         'layers': [4, 6, 8, 10],
-        'topk': [500, 750, 1000, 1250, 1500],
+        'topk': [900, 950, 1000, 1050, 1100],
         'fact_ratio': (0.90, 0.95, 0.01),
         'lr': (1e-4, 1e-2, True),
         'decay_rate': (0.90, 0.9999, False),
         'lamb': (1e-7, 1e-2, True),
-        'hidden_dim': [32, 48, 64, 96, 128, 192, 256],
+        'hidden_dim': [32, 48, 64, 96, 128],
         'd_path': [32, 64, 128],
         'd_type': [32, 64, 128],
         'attn_dim': unique_preserve_order([base_cfg['attn_dim'], 2, 4, 5, 8, 16, 32, 64]),
@@ -407,24 +406,6 @@ def save_best_result(study, path):
         json.dump(best_summary, f, indent=2, ensure_ascii=False)
 
 
-class StudyEarlyStopCallback:
-    def __init__(self, patience):
-        self.patience = patience
-        self.best_value = None
-        self.bad_rounds = 0
-
-    def __call__(self, study, trial):
-        current_best = study.best_value
-        if self.best_value is None or current_best > self.best_value:
-            self.best_value = current_best
-            self.bad_rounds = 0
-            return
-
-        self.bad_rounds += 1
-        if self.bad_rounds >= self.patience:
-            study.stop()
-
-
 def main():
     args = parse_args()
     dataset = infer_dataset_name(args.data_path)
@@ -460,8 +441,7 @@ def main():
     )
 
     objective = objective_factory(args, dataset, trial_log_path, checkpoint_dir)
-    callbacks = [StudyEarlyStopCallback(args.study_early_stop_rounds)]
-    study.optimize(objective, n_trials=args.n_trials, gc_after_trial=True, callbacks=callbacks)
+    study.optimize(objective, n_trials=args.n_trials, gc_after_trial=True)
 
     save_best_result(study, best_result_path)
 
