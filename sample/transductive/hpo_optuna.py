@@ -109,7 +109,8 @@ def parse_args():
     parser.add_argument('--topk', type=int, default=-1)
     parser.add_argument('--layers', type=int, default=-1)
     parser.add_argument('--d_rule', type=int, default=32)
-    parser.add_argument('--d_type', type=int, default=-1)
+    parser.add_argument('--d_rule_hidden', type=int, default=64)
+    parser.add_argument('--d_buffer', type=int, default=-1)
     parser.add_argument('--tau', type=float, default=1.0)
     parser.add_argument('--scheduler', type=str, default='exp')
     parser.add_argument('--remove_1hop_edges', action='store_true')
@@ -124,10 +125,9 @@ def parse_args():
     parser.add_argument('--lambda_rule', type=float, default=0.2)
     parser.add_argument('--lambda_keep', type=float, default=0.2)
     parser.add_argument('--lambda_rule_final', type=float, default=0.2)
-    parser.add_argument('--lambda_type', type=float, default=0.5)
     parser.add_argument('--beta_u', type=float, default=0.05)
-    parser.add_argument('--mu_t', type=float, default=0.1)
-    parser.add_argument('--gamma_t', type=float, default=0.2)
+    parser.add_argument('--rule_dropout', type=float, default=0.1)
+    parser.add_argument('--buffer_dropout', type=float, default=0.1)
     return parser.parse_args()
 
 
@@ -137,6 +137,15 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def safe_cuda_empty_cache():
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.empty_cache()
+    except RuntimeError:
+        pass
 
 
 def infer_dataset_name(data_path):
@@ -184,14 +193,14 @@ def apply_dataset_defaults(opts, dataset):
     opts.n_batch = base['n_batch']
     opts.n_tbatch = base['n_tbatch']
     opts.d_rule = 32 if getattr(opts, 'd_rule', -1) <= 0 else opts.d_rule
-    opts.d_type = opts.hidden_dim if getattr(opts, 'd_type', -1) <= 0 else opts.d_type
+    opts.d_rule_hidden = 2 * opts.d_rule if getattr(opts, 'd_rule_hidden', -1) <= 0 else opts.d_rule_hidden
+    opts.d_buffer = opts.hidden_dim if getattr(opts, 'd_buffer', -1) <= 0 else opts.d_buffer
     opts.lambda_rule = getattr(opts, 'lambda_rule', 0.2)
     opts.lambda_keep = getattr(opts, 'lambda_keep', 0.2)
     opts.lambda_rule_final = getattr(opts, 'lambda_rule_final', 0.2)
-    opts.lambda_type = getattr(opts, 'lambda_type', 0.5)
     opts.beta_u = getattr(opts, 'beta_u', 0.05)
-    opts.mu_t = getattr(opts, 'mu_t', 0.1)
-    opts.gamma_t = getattr(opts, 'gamma_t', 0.2)
+    opts.rule_dropout = getattr(opts, 'rule_dropout', 0.1)
+    opts.buffer_dropout = getattr(opts, 'buffer_dropout', 0.1)
     return base
 
 
@@ -205,16 +214,17 @@ def build_search_space(dataset, base_cfg):
         'lamb': (1e-7, 1e-2, True),
         'hidden_dim': [32, 48, 64, 96, 128],
         'd_rule': [16, 32, 48, 64, 128],
-        'd_type': [32, 64, 48, 64, 128],
+        'd_rule_hidden': [16, 32, 64, 128],
+        'd_buffer': [16, 32, 64, 128],
         'attn_dim': unique_preserve_order([base_cfg['attn_dim'], 2, 4, 5, 8, 16, 32, 64]),
         'dropout': (0.0, 0.5),
         'act': unique_preserve_order([base_cfg['act'], 'idd', 'relu', 'tanh']),
         'lambda_rule': (0.03, 0.5),
         'lambda_keep': (0.03, 0.5),
         'lambda_rule_final': (0.03, 0.5),
-        'lambda_type': (0.05, 0.8),
         'beta_u': (0.005, 0.2),
-        'mu_t': (0.01, 0.2),
+        'rule_dropout': (0.0, 0.3),
+        'buffer_dropout': (0.0, 0.3),
     }
 
 
@@ -233,7 +243,8 @@ def suggest_hyperparams(trial, opts, dataset, base_cfg):
     opts.lamb = trial.suggest_float('lamb', lamb_min, lamb_max, log=lamb_log)
     opts.hidden_dim = trial.suggest_categorical('hidden_dim', search_space['hidden_dim'])
     opts.d_rule = trial.suggest_categorical('d_rule', search_space['d_rule'])
-    opts.d_type = trial.suggest_categorical('d_type', search_space['d_type'])
+    opts.d_rule_hidden = trial.suggest_categorical('d_rule_hidden', search_space['d_rule_hidden'])
+    opts.d_buffer = trial.suggest_categorical('d_buffer', search_space['d_buffer'])
     opts.attn_dim = trial.suggest_categorical('attn_dim', search_space['attn_dim'])
     dropout_min, dropout_max = search_space['dropout']
     opts.dropout = trial.suggest_float('dropout', dropout_min, dropout_max)
@@ -244,12 +255,12 @@ def suggest_hyperparams(trial, opts, dataset, base_cfg):
     opts.lambda_keep = trial.suggest_float('lambda_keep', lk_min, lk_max)
     lrf_min, lrf_max = search_space['lambda_rule_final']
     opts.lambda_rule_final = trial.suggest_float('lambda_rule_final', lrf_min, lrf_max)
-    lt_min, lt_max = search_space['lambda_type']
-    opts.lambda_type = trial.suggest_float('lambda_type', lt_min, lt_max)
     bu_min, bu_max = search_space['beta_u']
     opts.beta_u = trial.suggest_float('beta_u', bu_min, bu_max)
-    mt_min, mt_max = search_space['mu_t']
-    opts.mu_t = trial.suggest_float('mu_t', mt_min, mt_max)
+    rd_min, rd_max = search_space['rule_dropout']
+    opts.rule_dropout = trial.suggest_float('rule_dropout', rd_min, rd_max)
+    bd_min, bd_max = search_space['buffer_dropout']
+    opts.buffer_dropout = trial.suggest_float('buffer_dropout', bd_min, bd_max)
     opts.n_edge_topk = -1
     opts.n_layer = opts.layers
     opts.n_node_topk = [opts.topk] * opts.layers
@@ -277,16 +288,17 @@ def summarize_trial_opts(opts):
         'lamb': opts.lamb,
         'hidden_dim': opts.hidden_dim,
         'd_rule': opts.d_rule,
-        'd_type': opts.d_type,
+        'd_rule_hidden': opts.d_rule_hidden,
+        'd_buffer': opts.d_buffer,
         'attn_dim': opts.attn_dim,
         'dropout': opts.dropout,
         'act': opts.act,
         'lambda_rule': opts.lambda_rule,
         'lambda_keep': opts.lambda_keep,
         'lambda_rule_final': opts.lambda_rule_final,
-        'lambda_type': opts.lambda_type,
         'beta_u': opts.beta_u,
-        'mu_t': opts.mu_t,
+        'rule_dropout': opts.rule_dropout,
+        'buffer_dropout': opts.buffer_dropout,
         'epoch': opts.epoch,
     }
 
@@ -362,8 +374,10 @@ def objective_factory(args, dataset, trial_log_path, checkpoint_dir):
             best_t_mrr = 0.0
             best_epoch = 0
             stale_rounds = opts.early_stop_rounds
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if best_ckpt_path is not None and os.path.exists(best_ckpt_path):
+                os.remove(best_ckpt_path)
+            best_ckpt_path = None
+            safe_cuda_empty_cache()
 
         if best_v_mrr == float('-inf'):
             best_v_mrr = 0.0
@@ -391,8 +405,7 @@ def objective_factory(args, dataset, trial_log_path, checkpoint_dir):
 
         del model
         del loader
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        safe_cuda_empty_cache()
 
         return best_v_mrr
 

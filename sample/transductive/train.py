@@ -15,7 +15,8 @@ parser.add_argument('--gpu', type=int, default=-1)
 parser.add_argument('--topk', type=int, default=-1)
 parser.add_argument('--layers', type=int, default=-1)
 parser.add_argument('--d_rule', type=int, default=32)
-parser.add_argument('--d_type', type=int, default=-1)
+parser.add_argument('--d_rule_hidden', type=int, default=64)
+parser.add_argument('--d_buffer', type=int, default=-1)
 parser.add_argument('--sampling', type=str, default='incremental')
 parser.add_argument('--weight', type=str, default=None)
 parser.add_argument('--tau', type=float, default=1.0)
@@ -32,10 +33,9 @@ parser.add_argument('--eval_interval', type=int, default=1)
 parser.add_argument('--lambda_rule', type=float, default=0.2)
 parser.add_argument('--lambda_keep', type=float, default=0.2)
 parser.add_argument('--lambda_rule_final', type=float, default=0.2)
-parser.add_argument('--lambda_type', type=float, default=0.5)
 parser.add_argument('--beta_u', type=float, default=0.05)
-parser.add_argument('--mu_t', type=float, default=0.1)
-parser.add_argument('--gamma_t', type=float, default=0.2)
+parser.add_argument('--rule_dropout', type=float, default=0.1)
+parser.add_argument('--buffer_dropout', type=float, default=0.1)
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -137,8 +137,10 @@ if __name__ == '__main__':
 
     if opts.d_rule <= 0:
         opts.d_rule = 32
-    if opts.d_type <= 0:
-        opts.d_type = opts.hidden_dim
+    if opts.d_rule_hidden <= 0:
+        opts.d_rule_hidden = 2 * opts.d_rule
+    if opts.d_buffer <= 0:
+        opts.d_buffer = opts.hidden_dim
     
     # check all output paths
     checkPath('./results/')
@@ -154,11 +156,12 @@ if __name__ == '__main__':
     with open(opts.perf_file, 'a+') as f:
         f.write(config_str)  
         f.write(
-            f'd_rule={opts.d_rule}, d_type={opts.d_type}, '
+            f'd_rule={opts.d_rule}, d_buffer={opts.d_buffer}, '
+            f'd_rule_hidden={opts.d_rule_hidden}, rule_dropout={opts.rule_dropout:.4f}, '
+            f'buffer_dropout={opts.buffer_dropout:.4f}, '
             f'lambda_rule={opts.lambda_rule:.4f}, lambda_keep={opts.lambda_keep:.4f}, '
-            f'lambda_rule_final={opts.lambda_rule_final:.4f}, lambda_type={opts.lambda_type:.4f}, '
-            f'beta_u={opts.beta_u:.4f}, mu_t={opts.mu_t:.4f}, '
-            f'gamma_t={opts.gamma_t:.4f}\n'
+            f'lambda_rule_final={opts.lambda_rule_final:.4f}, '
+            f'beta_u={opts.beta_u:.4f}\n'
         )
 
     if args.weight != None:

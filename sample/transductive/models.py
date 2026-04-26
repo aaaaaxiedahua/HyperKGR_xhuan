@@ -260,7 +260,7 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 ##########################################################################################################################################################################################
 
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, n_ent, d_rule, lambda_rule=0.2, lambda_keep=0.2, beta_u=0.05, n_node_topk=-1, n_edge_topk=-1, tau=1.0, act=lambda x:x):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, n_ent, d_rule, d_rule_hidden, rule_dropout=0.1, lambda_rule=0.2, lambda_keep=0.2, beta_u=0.05, n_node_topk=-1, n_edge_topk=-1, tau=1.0, act=lambda x:x):
         super(GNNLayer, self).__init__()
         self.n_rel       = n_rel
         self.n_ent       = n_ent
@@ -268,6 +268,7 @@ class GNNLayer(torch.nn.Module):
         self.out_dim     = out_dim
         self.attn_dim    = attn_dim
         self.d_rule      = d_rule
+        self.d_rule_hidden = d_rule_hidden
         self.lambda_rule = lambda_rule
         self.lambda_keep = lambda_keep
         self.beta_u      = beta_u
@@ -282,6 +283,9 @@ class GNNLayer(torch.nn.Module):
         self.w_alpha     = nn.Linear(attn_dim, 1)
         self.W_h         = nn.Linear(in_dim, out_dim, bias=False)
         self.W_samp      = nn.Linear(in_dim, 1, bias=False)
+        self.rule_dropout = nn.Dropout(rule_dropout)
+        self.rule_fc      = nn.Linear(3 * d_rule, d_rule_hidden)
+        self.rule_out     = nn.Linear(d_rule_hidden, 1)
         
     def train(self, mode=True):
         if not isinstance(mode, bool):
@@ -312,7 +316,8 @@ class GNNLayer(torch.nn.Module):
         
         base_logit = self.w_alpha(nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))).squeeze(-1)
         query_rule_edge = query_rule_pref[r_idx]
-        rule_score = F.cosine_similarity(edge_rule, query_rule_edge, dim=-1)
+        rule_feat = torch.cat([edge_rule, query_rule_edge, edge_rule * query_rule_edge], dim=-1)
+        rule_score = self.rule_out(self.rule_dropout(nn.ReLU()(self.rule_fc(rule_feat)))).squeeze(-1)
         self_loop_mask = rel == (self.n_rel * 2)
         if self_loop_mask.any():
             rule_score = rule_score.clone()
@@ -431,7 +436,8 @@ class GNNModel(torch.nn.Module):
         self.n_layer     = params.n_layer
         self.hidden_dim  = params.hidden_dim
         self.d_rule      = params.d_rule
-        self.d_type      = params.d_type
+        self.d_rule_hidden = params.d_rule_hidden
+        self.d_buffer    = params.d_buffer
         self.attn_dim    = params.attn_dim
         self.n_ent       = params.n_ent
         self.n_rel       = params.n_rel
@@ -441,10 +447,7 @@ class GNNModel(torch.nn.Module):
         self.lambda_rule = params.lambda_rule
         self.lambda_keep = params.lambda_keep
         self.lambda_rule_final = params.lambda_rule_final
-        self.lambda_type = params.lambda_type
         self.beta_u      = params.beta_u
-        self.mu_t        = params.mu_t
-        self.gamma_t     = params.gamma_t
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act  = acts[params.act]
         self.curvature = torch.nn.Parameter(torch.tensor(1.0))
@@ -452,18 +455,28 @@ class GNNModel(torch.nn.Module):
         self.gnn_layers = []
         for i in range(self.n_layer):
             i_n_node_topk = self.n_node_topk if 'int' in str(type(self.n_node_topk)) else self.n_node_topk[i]
-            self.gnn_layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, self.n_ent, self.d_rule, \
+            self.gnn_layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, self.n_ent, self.d_rule, self.d_rule_hidden, \
+                                            rule_dropout=params.rule_dropout, \
                                             lambda_rule=self.lambda_rule, lambda_keep=self.lambda_keep, beta_u=self.beta_u, \
                                             n_node_topk=i_n_node_topk, n_edge_topk=self.n_edge_topk, tau=params.tau, act=act))
 
         self.gnn_layers = nn.ModuleList(self.gnn_layers)       
         self.dropout = nn.Dropout(params.dropout)
         self.W_final = nn.Linear(self.hidden_dim, 1, bias=False)
-        self.gate    = nn.GRU(self.hidden_dim, self.hidden_dim)
         self.rule_embed = nn.Embedding(2 * self.n_rel + 1, self.d_rule)
         self.rule_query = nn.ModuleList([nn.Linear(self.d_rule, self.d_rule, bias=False) for _ in range(self.n_layer)])
-        self.type_prototypes = nn.Embedding(2 * self.n_rel, self.d_type)
-        self.W_type = nn.Linear(self.hidden_dim, self.d_type, bias=False)
+        self.buffer_dropout = nn.Dropout(params.buffer_dropout)
+        self.buffer_mlp = nn.Linear(2 * self.hidden_dim + 2, self.d_buffer)
+        self.buffer_out = nn.Linear(self.d_buffer, self.hidden_dim)
+        nn.init.zeros_(self.buffer_mlp.bias)
+        nn.init.zeros_(self.buffer_out.bias)
+
+    def buffer_update(self, hidden_new, hidden_old, rule_node, rule_uncertainty):
+        rule_feat = torch.stack([rule_node, rule_uncertainty], dim=-1)
+        buffer_feat = torch.cat([hidden_new, hidden_old, rule_feat], dim=-1)
+        gate = torch.sigmoid(self.buffer_out(self.buffer_dropout(F.relu(self.buffer_mlp(buffer_feat)))))
+        hidden = gate * hidden_new + (1.0 - gate) * hidden_old
+        return sanitize_tensor(hidden, nan=0.0, posinf=1.0, neginf=-1.0)
 
     def updateTopkNums(self, topk_list):
         assert len(topk_list) == self.n_layer
@@ -503,27 +516,21 @@ class GNNModel(torch.nn.Module):
                 self.curvature, edge_rule, query_rule_pref
             )
 
-            # combine h0 and hi -> update hi with gate operation
-            h0          = torch.zeros(1, n_node, hidden.size(1)).cuda().index_copy_(1, old_nodes_new_idx, h0)
-            h0          = h0[0, sampled_nodes_idx, :].unsqueeze(0)
+            # Rule-aware buffer keeps useful old states and suppresses uncertain updates.
+            h_old       = torch.zeros(1, n_node, hidden.size(1)).cuda().index_copy_(1, old_nodes_new_idx, h0)
+            h_old       = h_old[0, sampled_nodes_idx, :]
             hidden      = self.dropout(hidden)
-            hidden, h0  = self.gate(hidden.unsqueeze(0), h0)
-            hidden      = hidden.squeeze(0)
+            hidden      = self.buffer_update(hidden, h_old, rule_node, rule_uncertainty)
+            h0          = hidden.unsqueeze(0)
             
         # readout
         # [K, 2] (batch_idx, node_idx) K is w.r.t. n_nodes
         scores_base = sanitize_tensor(self.W_final(hidden).squeeze(-1), nan=0.0)
-        node_query_rel = q_rel[nodes[:,0]]
-        type_hidden = sanitize_tensor(self.W_type(hidden), nan=0.0)
-        type_scores = F.cosine_similarity(type_hidden, self.type_prototypes(node_query_rel), dim=-1)
-        type_scores = sanitize_tensor(type_scores, nan=0.0, posinf=1.0, neginf=-1.0, min_value=-1.0, max_value=1.0)
         rule_scores = sanitize_tensor(rule_node, nan=0.0, posinf=1.0, neginf=-1.0, min_value=-1.0, max_value=1.0)
         rule_uncertainty = sanitize_tensor(rule_uncertainty, nan=0.0, posinf=MAX_DISTANCE, neginf=0.0, min_value=0.0, max_value=MAX_DISTANCE)
         scores = sanitize_tensor(
             scores_base
-            + self.lambda_type * type_scores
-            + self.lambda_rule_final * rule_scores
-            - self.beta_u * rule_uncertainty,
+            + self.lambda_rule_final * rule_scores,
             nan=-MAX_DISTANCE,
         )
         # non-visited entities have 0 scores
@@ -536,32 +543,7 @@ class GNNModel(torch.nn.Module):
         return scores_all, {
             'nodes': nodes,
             'hidden': hidden,
-            'type_hidden': type_hidden,
             'rule_scores': rule_scores,
             'rule_uncertainty': rule_uncertainty,
             'q_rel': q_rel,
         }
-
-    def auxiliary_losses(self, details, rels, targets):
-        nodes = details['nodes']
-        hidden = details['hidden']
-        type_hidden = details['type_hidden']
-        q_rel = torch.as_tensor(rels, dtype=torch.long, device=hidden.device)
-        targets = torch.as_tensor(targets, dtype=torch.long, device=hidden.device)
-        batch_size = q_rel.size(0)
-
-        node_lookup = torch.full((batch_size, self.n_ent), -1, dtype=torch.long, device=hidden.device)
-        node_lookup[nodes[:,0], nodes[:,1]] = torch.arange(nodes.size(0), device=hidden.device)
-        pos_idx = node_lookup[torch.arange(batch_size, device=hidden.device), targets]
-        valid_mask = pos_idx >= 0
-        if valid_mask.sum() <= 1:
-            return hidden.new_tensor(0.0)
-
-        pos_idx = pos_idx[valid_mask]
-        rel_idx = q_rel[valid_mask]
-        pos_type = type_hidden[pos_idx]
-        type_proto = self.type_prototypes(rel_idx)
-        type_logits = (F.normalize(type_proto, dim=-1) @ F.normalize(pos_type, dim=-1).transpose(0, 1)) / max(self.gamma_t, 1e-6)
-        type_logits = sanitize_tensor(type_logits, nan=0.0, posinf=MAX_LOGIT, neginf=-MAX_LOGIT, min_value=-MAX_LOGIT, max_value=MAX_LOGIT)
-        labels = torch.arange(pos_idx.size(0), device=hidden.device)
-        return F.cross_entropy(type_logits, labels)

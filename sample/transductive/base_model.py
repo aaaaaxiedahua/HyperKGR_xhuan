@@ -91,17 +91,13 @@ class BaseModel(object):
             triple = self.loader.get_batch(batch_idx)
 
             self.model.zero_grad()
-            scores, details = self.model(triple[:,0], triple[:,1], return_details=True)
+            scores = self.model(triple[:,0], triple[:,1])
             pos_scores = scores[[torch.arange(len(scores)).cuda(), torch.LongTensor(triple[:,2]).cuda()]]
 
             max_n = torch.max(scores, 1, keepdim=True)[0]
-            loss_rank = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1)))
-            loss_type = self.model.auxiliary_losses(details, triple[:,1], triple[:,2])
-            if not torch.isfinite(loss_type):
-                loss_type = loss_rank.new_tensor(0.0)
-            loss = loss_rank + self.args.mu_t * loss_type
+            loss = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1)))
             if not torch.isfinite(loss):
-                print(f'==> skip non-finite training batch at step {i}: rank={loss_rank.item() if torch.isfinite(loss_rank) else "nan"}, type={loss_type.item() if torch.isfinite(loss_type) else "nan"}')
+                print(f'==> skip non-finite training batch at step {i}: loss={loss.item() if torch.isfinite(loss) else "nan"}')
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
             loss.backward()
