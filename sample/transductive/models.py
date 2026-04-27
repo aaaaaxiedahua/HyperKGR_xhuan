@@ -260,7 +260,7 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 ##########################################################################################################################################################################################
 
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, n_ent, d_rule, d_rule_hidden, rule_dropout=0.1, lambda_rule=0.2, lambda_keep=0.2, beta_u=0.05, n_node_topk=-1, n_edge_topk=-1, tau=1.0, act=lambda x:x):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, n_ent, d_rule, lambda_rule=0.2, lambda_keep=0.2, beta_u=0.05, n_node_topk=-1, n_edge_topk=-1, tau=1.0, act=lambda x:x):
         super(GNNLayer, self).__init__()
         self.n_rel       = n_rel
         self.n_ent       = n_ent
@@ -268,7 +268,6 @@ class GNNLayer(torch.nn.Module):
         self.out_dim     = out_dim
         self.attn_dim    = attn_dim
         self.d_rule      = d_rule
-        self.d_rule_hidden = d_rule_hidden
         self.lambda_rule = lambda_rule
         self.lambda_keep = lambda_keep
         self.beta_u      = beta_u
@@ -283,9 +282,6 @@ class GNNLayer(torch.nn.Module):
         self.w_alpha     = nn.Linear(attn_dim, 1)
         self.W_h         = nn.Linear(in_dim, out_dim, bias=False)
         self.W_samp      = nn.Linear(in_dim, 1, bias=False)
-        self.rule_dropout = nn.Dropout(rule_dropout)
-        self.rule_fc      = nn.Linear(3 * d_rule, d_rule_hidden)
-        self.rule_out     = nn.Linear(d_rule_hidden, 1)
         
     def train(self, mode=True):
         if not isinstance(mode, bool):
@@ -316,8 +312,7 @@ class GNNLayer(torch.nn.Module):
         
         base_logit = self.w_alpha(nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))).squeeze(-1)
         query_rule_edge = query_rule_pref[r_idx]
-        rule_feat = torch.cat([edge_rule, query_rule_edge, edge_rule * query_rule_edge], dim=-1)
-        rule_score = self.rule_out(self.rule_dropout(nn.ReLU()(self.rule_fc(rule_feat)))).squeeze(-1)
+        rule_score = F.cosine_similarity(edge_rule, query_rule_edge, dim=-1)
         self_loop_mask = rel == (self.n_rel * 2)
         if self_loop_mask.any():
             rule_score = rule_score.clone()
@@ -436,7 +431,6 @@ class GNNModel(torch.nn.Module):
         self.n_layer     = params.n_layer
         self.hidden_dim  = params.hidden_dim
         self.d_rule      = params.d_rule
-        self.d_rule_hidden = params.d_rule_hidden
         self.d_buffer    = params.d_buffer
         self.attn_dim    = params.attn_dim
         self.n_ent       = params.n_ent
@@ -455,8 +449,7 @@ class GNNModel(torch.nn.Module):
         self.gnn_layers = []
         for i in range(self.n_layer):
             i_n_node_topk = self.n_node_topk if 'int' in str(type(self.n_node_topk)) else self.n_node_topk[i]
-            self.gnn_layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, self.n_ent, self.d_rule, self.d_rule_hidden, \
-                                            rule_dropout=params.rule_dropout, \
+            self.gnn_layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, self.n_ent, self.d_rule, \
                                             lambda_rule=self.lambda_rule, lambda_keep=self.lambda_keep, beta_u=self.beta_u, \
                                             n_node_topk=i_n_node_topk, n_edge_topk=self.n_edge_topk, tau=params.tau, act=act))
 

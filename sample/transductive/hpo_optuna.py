@@ -109,7 +109,6 @@ def parse_args():
     parser.add_argument('--topk', type=int, default=-1)
     parser.add_argument('--layers', type=int, default=-1)
     parser.add_argument('--d_rule', type=int, default=32)
-    parser.add_argument('--d_rule_hidden', type=int, default=64)
     parser.add_argument('--d_buffer', type=int, default=-1)
     parser.add_argument('--tau', type=float, default=1.0)
     parser.add_argument('--scheduler', type=str, default='exp')
@@ -126,7 +125,6 @@ def parse_args():
     parser.add_argument('--lambda_keep', type=float, default=0.2)
     parser.add_argument('--lambda_rule_final', type=float, default=0.2)
     parser.add_argument('--beta_u', type=float, default=0.05)
-    parser.add_argument('--rule_dropout', type=float, default=0.1)
     parser.add_argument('--buffer_dropout', type=float, default=0.1)
     return parser.parse_args()
 
@@ -193,20 +191,18 @@ def apply_dataset_defaults(opts, dataset):
     opts.n_batch = base['n_batch']
     opts.n_tbatch = base['n_tbatch']
     opts.d_rule = 32 if getattr(opts, 'd_rule', -1) <= 0 else opts.d_rule
-    opts.d_rule_hidden = 2 * opts.d_rule if getattr(opts, 'd_rule_hidden', -1) <= 0 else opts.d_rule_hidden
     opts.d_buffer = opts.hidden_dim if getattr(opts, 'd_buffer', -1) <= 0 else opts.d_buffer
     opts.lambda_rule = getattr(opts, 'lambda_rule', 0.2)
     opts.lambda_keep = getattr(opts, 'lambda_keep', 0.2)
     opts.lambda_rule_final = getattr(opts, 'lambda_rule_final', 0.2)
     opts.beta_u = getattr(opts, 'beta_u', 0.05)
-    opts.rule_dropout = getattr(opts, 'rule_dropout', 0.1)
     opts.buffer_dropout = getattr(opts, 'buffer_dropout', 0.1)
     return base
 
 
 def build_search_space(dataset, base_cfg):
     return {
-        'layers': [4, 6, 8, 10],
+        'layers': [4, 6, 8],
         'topk': [900, 950, 1000, 1050, 1100],
         'fact_ratio': (0.90, 0.95, 0.01),
         'lr': (1e-4, 1e-2, True),
@@ -214,16 +210,14 @@ def build_search_space(dataset, base_cfg):
         'lamb': (1e-7, 1e-2, True),
         'hidden_dim': [32, 48, 64, 96, 128],
         'd_rule': [16, 32, 48, 64, 128],
-        'd_rule_hidden': [16, 32, 64, 128],
         'd_buffer': [16, 32, 64, 128],
-        'attn_dim': unique_preserve_order([base_cfg['attn_dim'], 2, 4, 5, 8, 16, 32, 64]),
+        'attn_dim': unique_preserve_order([base_cfg['attn_dim'], 2, 4, 5, 6, 8, 16]),
         'dropout': (0.0, 0.5),
         'act': unique_preserve_order([base_cfg['act'], 'idd', 'relu', 'tanh']),
         'lambda_rule': (0.03, 0.5),
         'lambda_keep': (0.03, 0.5),
         'lambda_rule_final': (0.03, 0.5),
         'beta_u': (0.005, 0.2),
-        'rule_dropout': (0.0, 0.3),
         'buffer_dropout': (0.0, 0.3),
     }
 
@@ -243,7 +237,6 @@ def suggest_hyperparams(trial, opts, dataset, base_cfg):
     opts.lamb = trial.suggest_float('lamb', lamb_min, lamb_max, log=lamb_log)
     opts.hidden_dim = trial.suggest_categorical('hidden_dim', search_space['hidden_dim'])
     opts.d_rule = trial.suggest_categorical('d_rule', search_space['d_rule'])
-    opts.d_rule_hidden = trial.suggest_categorical('d_rule_hidden', search_space['d_rule_hidden'])
     opts.d_buffer = trial.suggest_categorical('d_buffer', search_space['d_buffer'])
     opts.attn_dim = trial.suggest_categorical('attn_dim', search_space['attn_dim'])
     dropout_min, dropout_max = search_space['dropout']
@@ -257,8 +250,6 @@ def suggest_hyperparams(trial, opts, dataset, base_cfg):
     opts.lambda_rule_final = trial.suggest_float('lambda_rule_final', lrf_min, lrf_max)
     bu_min, bu_max = search_space['beta_u']
     opts.beta_u = trial.suggest_float('beta_u', bu_min, bu_max)
-    rd_min, rd_max = search_space['rule_dropout']
-    opts.rule_dropout = trial.suggest_float('rule_dropout', rd_min, rd_max)
     bd_min, bd_max = search_space['buffer_dropout']
     opts.buffer_dropout = trial.suggest_float('buffer_dropout', bd_min, bd_max)
     opts.n_edge_topk = -1
@@ -288,7 +279,6 @@ def summarize_trial_opts(opts):
         'lamb': opts.lamb,
         'hidden_dim': opts.hidden_dim,
         'd_rule': opts.d_rule,
-        'd_rule_hidden': opts.d_rule_hidden,
         'd_buffer': opts.d_buffer,
         'attn_dim': opts.attn_dim,
         'dropout': opts.dropout,
@@ -297,7 +287,6 @@ def summarize_trial_opts(opts):
         'lambda_keep': opts.lambda_keep,
         'lambda_rule_final': opts.lambda_rule_final,
         'beta_u': opts.beta_u,
-        'rule_dropout': opts.rule_dropout,
         'buffer_dropout': opts.buffer_dropout,
         'epoch': opts.epoch,
     }

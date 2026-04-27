@@ -15,7 +15,6 @@ parser.add_argument('--gpu', type=int, default=-1)
 parser.add_argument('--topk', type=int, default=-1)
 parser.add_argument('--layers', type=int, default=-1)
 parser.add_argument('--d_rule', type=int, default=32)
-parser.add_argument('--d_rule_hidden', type=int, default=64)
 parser.add_argument('--d_buffer', type=int, default=-1)
 parser.add_argument('--sampling', type=str, default='incremental')
 parser.add_argument('--weight', type=str, default=None)
@@ -34,7 +33,6 @@ parser.add_argument('--lambda_rule', type=float, default=0.2)
 parser.add_argument('--lambda_keep', type=float, default=0.2)
 parser.add_argument('--lambda_rule_final', type=float, default=0.2)
 parser.add_argument('--beta_u', type=float, default=0.05)
-parser.add_argument('--rule_dropout', type=float, default=0.1)
 parser.add_argument('--buffer_dropout', type=float, default=0.1)
 args = parser.parse_args()
 
@@ -137,8 +135,6 @@ if __name__ == '__main__':
 
     if opts.d_rule <= 0:
         opts.d_rule = 32
-    if opts.d_rule_hidden <= 0:
-        opts.d_rule_hidden = 2 * opts.d_rule
     if opts.d_buffer <= 0:
         opts.d_buffer = opts.hidden_dim
     
@@ -157,7 +153,6 @@ if __name__ == '__main__':
         f.write(config_str)  
         f.write(
             f'd_rule={opts.d_rule}, d_buffer={opts.d_buffer}, '
-            f'd_rule_hidden={opts.d_rule_hidden}, rule_dropout={opts.rule_dropout:.4f}, '
             f'buffer_dropout={opts.buffer_dropout:.4f}, '
             f'lambda_rule={opts.lambda_rule:.4f}, lambda_keep={opts.lambda_keep:.4f}, '
             f'lambda_rule_final={opts.lambda_rule_final:.4f}, '
