@@ -122,9 +122,7 @@ def parse_args():
     parser.add_argument('--storage', type=str, default=None)
     parser.add_argument('--weight', type=str, default=None)
     parser.add_argument('--lambda_rule', type=float, default=0.2)
-    parser.add_argument('--lambda_keep', type=float, default=0.2)
-    parser.add_argument('--lambda_rule_final', type=float, default=0.2)
-    parser.add_argument('--beta_u', type=float, default=0.05)
+    parser.add_argument('--lambda_msg', type=float, default=0.5)
     parser.add_argument('--buffer_dropout', type=float, default=0.1)
     return parser.parse_args()
 
@@ -132,9 +130,19 @@ def parse_args():
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
+    try:
+        torch.manual_seed(seed)
+    except RuntimeError as exc:
+        if 'out of memory' not in str(exc).lower():
+            raise
+        safe_cuda_empty_cache()
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        try:
+            torch.cuda.manual_seed_all(seed)
+        except RuntimeError as exc:
+            if 'out of memory' not in str(exc).lower():
+                raise
+            safe_cuda_empty_cache()
 
 
 def safe_cuda_empty_cache():
@@ -193,9 +201,7 @@ def apply_dataset_defaults(opts, dataset):
     opts.d_rule = 32 if getattr(opts, 'd_rule', -1) <= 0 else opts.d_rule
     opts.d_buffer = opts.hidden_dim if getattr(opts, 'd_buffer', -1) <= 0 else opts.d_buffer
     opts.lambda_rule = getattr(opts, 'lambda_rule', 0.2)
-    opts.lambda_keep = getattr(opts, 'lambda_keep', 0.2)
-    opts.lambda_rule_final = getattr(opts, 'lambda_rule_final', 0.2)
-    opts.beta_u = getattr(opts, 'beta_u', 0.05)
+    opts.lambda_msg = getattr(opts, 'lambda_msg', 0.5)
     opts.buffer_dropout = getattr(opts, 'buffer_dropout', 0.1)
     return base
 
@@ -209,15 +215,13 @@ def build_search_space(dataset, base_cfg):
         'decay_rate': (0.90, 0.9999, False),
         'lamb': (1e-7, 1e-2, True),
         'hidden_dim': [32, 48, 64, 96, 128],
-        'd_rule': [16, 32, 48, 64, 128],
-        'd_buffer': [16, 32, 64, 128],
+        'd_rule': [16, 32, 48, 64],
+        'd_buffer': [16, 32, 64],
         'attn_dim': unique_preserve_order([base_cfg['attn_dim'], 2, 4, 5, 6, 8, 16]),
         'dropout': (0.0, 0.5),
         'act': unique_preserve_order([base_cfg['act'], 'idd', 'relu', 'tanh']),
         'lambda_rule': (0.03, 0.5),
-        'lambda_keep': (0.03, 0.5),
-        'lambda_rule_final': (0.03, 0.5),
-        'beta_u': (0.005, 0.2),
+        'lambda_msg': (0.05, 0.7),
         'buffer_dropout': (0.0, 0.3),
     }
 
@@ -244,12 +248,8 @@ def suggest_hyperparams(trial, opts, dataset, base_cfg):
     opts.act = trial.suggest_categorical('act', search_space['act'])
     lr_min, lr_max = search_space['lambda_rule']
     opts.lambda_rule = trial.suggest_float('lambda_rule', lr_min, lr_max)
-    lk_min, lk_max = search_space['lambda_keep']
-    opts.lambda_keep = trial.suggest_float('lambda_keep', lk_min, lk_max)
-    lrf_min, lrf_max = search_space['lambda_rule_final']
-    opts.lambda_rule_final = trial.suggest_float('lambda_rule_final', lrf_min, lrf_max)
-    bu_min, bu_max = search_space['beta_u']
-    opts.beta_u = trial.suggest_float('beta_u', bu_min, bu_max)
+    lm_min, lm_max = search_space['lambda_msg']
+    opts.lambda_msg = trial.suggest_float('lambda_msg', lm_min, lm_max)
     bd_min, bd_max = search_space['buffer_dropout']
     opts.buffer_dropout = trial.suggest_float('buffer_dropout', bd_min, bd_max)
     opts.n_edge_topk = -1
@@ -284,9 +284,7 @@ def summarize_trial_opts(opts):
         'dropout': opts.dropout,
         'act': opts.act,
         'lambda_rule': opts.lambda_rule,
-        'lambda_keep': opts.lambda_keep,
-        'lambda_rule_final': opts.lambda_rule_final,
-        'beta_u': opts.beta_u,
+        'lambda_msg': opts.lambda_msg,
         'buffer_dropout': opts.buffer_dropout,
         'epoch': opts.epoch,
     }

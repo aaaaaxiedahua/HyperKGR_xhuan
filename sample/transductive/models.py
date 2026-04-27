@@ -260,7 +260,7 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 ##########################################################################################################################################################################################
 
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, n_ent, d_rule, lambda_rule=0.2, lambda_keep=0.2, beta_u=0.05, n_node_topk=-1, n_edge_topk=-1, tau=1.0, act=lambda x:x):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, n_ent, d_rule, lambda_rule=0.2, lambda_msg=0.5, n_node_topk=-1, n_edge_topk=-1, tau=1.0, act=lambda x:x):
         super(GNNLayer, self).__init__()
         self.n_rel       = n_rel
         self.n_ent       = n_ent
@@ -269,8 +269,7 @@ class GNNLayer(torch.nn.Module):
         self.attn_dim    = attn_dim
         self.d_rule      = d_rule
         self.lambda_rule = lambda_rule
-        self.lambda_keep = lambda_keep
-        self.beta_u      = beta_u
+        self.lambda_msg  = lambda_msg
         self.act         = act
         self.n_node_topk = n_node_topk
         self.n_edge_topk = n_edge_topk
@@ -340,16 +339,6 @@ class GNNLayer(torch.nn.Module):
         alpha_sum = scatter(alpha_exp, index=obj, dim=0, dim_size=n_node, reduce='sum')
         alpha = alpha_exp / alpha_sum[obj].clamp_min(MIN_NORM)
         alpha = sanitize_tensor(alpha, nan=0.0, posinf=1.0, neginf=0.0, min_value=0.0, max_value=1.0)
-        rule_node = scatter(alpha * rule_score, index=obj, dim=0, dim_size=n_node, reduce='sum')
-        rule_uncertainty = scatter(
-            -alpha * torch.log(alpha.clamp_min(MIN_NORM)),
-            index=obj,
-            dim=0,
-            dim_size=n_node,
-            reduce='sum',
-        )
-        rule_node = sanitize_tensor(rule_node, nan=0.0, posinf=1.0, neginf=-1.0, min_value=-1.0, max_value=1.0)
-        rule_uncertainty = sanitize_tensor(rule_uncertainty, nan=0.0, posinf=MAX_DISTANCE, neginf=0.0, min_value=0.0, max_value=MAX_DISTANCE)
 
         # suppose all embedding are in tangetn space
         hr = expmap0(hr, curvature)
@@ -362,7 +351,9 @@ class GNNLayer(torch.nn.Module):
 
 
         # aggregate message and then propagate
-        message     = alpha.unsqueeze(-1) * message
+        rule_gate   = 2.0 * torch.sigmoid(self.lambda_msg * rule_score)
+        rule_gate   = sanitize_tensor(rule_gate, nan=1.0, posinf=2.0, neginf=0.0, min_value=0.0, max_value=2.0)
+        message     = alpha.unsqueeze(-1) * rule_gate.unsqueeze(-1) * message
         message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
 
         # to poincare space
@@ -378,7 +369,7 @@ class GNNLayer(torch.nn.Module):
         # forward without node sampling
         if self.n_node_topk <= 0:
             keep_mask = torch.ones(n_node, dtype=torch.bool, device=hidden_new.device)
-            return hidden_new, rule_node, rule_uncertainty, nodes, keep_mask
+            return hidden_new, nodes, keep_mask
 
         # forward with node sampling
         # indexing sampling operation
@@ -388,11 +379,7 @@ class GNNLayer(torch.nn.Module):
         diff_node = nodes[bool_diff_node_idx]
 
         # project logit to fixed-size tensor via indexing
-        diff_node_logit = (
-            self.W_samp(hidden_new[bool_diff_node_idx]).squeeze(-1)
-            + self.lambda_keep * rule_node[bool_diff_node_idx]
-            - self.beta_u * rule_uncertainty[bool_diff_node_idx]
-        ) # [all_batch_new_nodes]
+        diff_node_logit = self.W_samp(hidden_new[bool_diff_node_idx]).squeeze(-1) # [all_batch_new_nodes]
         
         # save logit to node_scores for later indexing
         node_scores = torch.ones((batchsize, self.n_ent)).cuda() * float('-inf')
@@ -420,10 +407,8 @@ class GNNLayer(torch.nn.Module):
         # extract sampled nodes an their embeddings
         new_nodes  = nodes[bool_same_node_idx]
         hidden_new = hidden_new[bool_same_node_idx]
-        rule_node = rule_node[bool_same_node_idx]
-        rule_uncertainty = rule_uncertainty[bool_same_node_idx]
 
-        return hidden_new, rule_node, rule_uncertainty, new_nodes, bool_same_node_idx
+        return hidden_new, new_nodes, bool_same_node_idx
 
 class GNNModel(torch.nn.Module):
     def __init__(self, params, loader):
@@ -439,9 +424,7 @@ class GNNModel(torch.nn.Module):
         self.n_edge_topk = params.n_edge_topk
         self.loader      = loader
         self.lambda_rule = params.lambda_rule
-        self.lambda_keep = params.lambda_keep
-        self.lambda_rule_final = params.lambda_rule_final
-        self.beta_u      = params.beta_u
+        self.lambda_msg  = params.lambda_msg
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act  = acts[params.act]
         self.curvature = torch.nn.Parameter(torch.tensor(1.0))
@@ -450,7 +433,7 @@ class GNNModel(torch.nn.Module):
         for i in range(self.n_layer):
             i_n_node_topk = self.n_node_topk if 'int' in str(type(self.n_node_topk)) else self.n_node_topk[i]
             self.gnn_layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, self.n_ent, self.d_rule, \
-                                            lambda_rule=self.lambda_rule, lambda_keep=self.lambda_keep, beta_u=self.beta_u, \
+                                            lambda_rule=self.lambda_rule, lambda_msg=self.lambda_msg, \
                                             n_node_topk=i_n_node_topk, n_edge_topk=self.n_edge_topk, tau=params.tau, act=act))
 
         self.gnn_layers = nn.ModuleList(self.gnn_layers)       
@@ -459,14 +442,13 @@ class GNNModel(torch.nn.Module):
         self.rule_embed = nn.Embedding(2 * self.n_rel + 1, self.d_rule)
         self.rule_query = nn.ModuleList([nn.Linear(self.d_rule, self.d_rule, bias=False) for _ in range(self.n_layer)])
         self.buffer_dropout = nn.Dropout(params.buffer_dropout)
-        self.buffer_mlp = nn.Linear(2 * self.hidden_dim + 2, self.d_buffer)
+        self.buffer_mlp = nn.Linear(2 * self.hidden_dim, self.d_buffer)
         self.buffer_out = nn.Linear(self.d_buffer, self.hidden_dim)
         nn.init.zeros_(self.buffer_mlp.bias)
         nn.init.zeros_(self.buffer_out.bias)
 
-    def buffer_update(self, hidden_new, hidden_old, rule_node, rule_uncertainty):
-        rule_feat = torch.stack([rule_node, rule_uncertainty], dim=-1)
-        buffer_feat = torch.cat([hidden_new, hidden_old, rule_feat], dim=-1)
+    def buffer_update(self, hidden_new, hidden_old):
+        buffer_feat = torch.cat([hidden_new, hidden_old], dim=-1)
         gate = torch.sigmoid(self.buffer_out(self.buffer_dropout(F.relu(self.buffer_mlp(buffer_feat)))))
         hidden = gate * hidden_new + (1.0 - gate) * hidden_old
         return sanitize_tensor(hidden, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -489,8 +471,6 @@ class GNNModel(torch.nn.Module):
         h0     = torch.zeros((1, n, self.hidden_dim)).cuda()                              # [1, B, dim]
         nodes  = torch.cat([torch.arange(n).unsqueeze(1).cuda(), q_sub.unsqueeze(1)], 1)  # [B, 2] with (batch_idx, node_idx)
         hidden = torch.zeros(n, self.hidden_dim).cuda()                                   # [B, dim]
-        rule_node = torch.zeros(n, device=hidden.device)
-        rule_uncertainty = torch.zeros(n, device=hidden.device)
     
         for i in range(self.n_layer):
             # layers with sampling
@@ -504,28 +484,21 @@ class GNNModel(torch.nn.Module):
 
             # GNN forward -> get hidden representation at i-th layer
             # hidden: [k1, dim]
-            hidden, rule_node, rule_uncertainty, nodes, sampled_nodes_idx = self.gnn_layers[i](
+            hidden, nodes, sampled_nodes_idx = self.gnn_layers[i](
                 q_sub, q_rel, hidden, edges, nodes, old_nodes_new_idx, n,
                 self.curvature, edge_rule, query_rule_pref
             )
 
-            # Rule-aware buffer keeps useful old states and suppresses uncertain updates.
+            # Lightweight buffer replaces GRU without adding recurrent CUDA state.
             h_old       = torch.zeros(1, n_node, hidden.size(1)).cuda().index_copy_(1, old_nodes_new_idx, h0)
             h_old       = h_old[0, sampled_nodes_idx, :]
             hidden      = self.dropout(hidden)
-            hidden      = self.buffer_update(hidden, h_old, rule_node, rule_uncertainty)
+            hidden      = self.buffer_update(hidden, h_old)
             h0          = hidden.unsqueeze(0)
             
         # readout
         # [K, 2] (batch_idx, node_idx) K is w.r.t. n_nodes
-        scores_base = sanitize_tensor(self.W_final(hidden).squeeze(-1), nan=0.0)
-        rule_scores = sanitize_tensor(rule_node, nan=0.0, posinf=1.0, neginf=-1.0, min_value=-1.0, max_value=1.0)
-        rule_uncertainty = sanitize_tensor(rule_uncertainty, nan=0.0, posinf=MAX_DISTANCE, neginf=0.0, min_value=0.0, max_value=MAX_DISTANCE)
-        scores = sanitize_tensor(
-            scores_base
-            + self.lambda_rule_final * rule_scores,
-            nan=-MAX_DISTANCE,
-        )
+        scores = sanitize_tensor(self.W_final(hidden).squeeze(-1), nan=-MAX_DISTANCE)
         # non-visited entities have 0 scores
         scores_all = torch.zeros((n, self.loader.n_ent)).cuda()         
         # [B, n_all_nodes]
@@ -536,7 +509,5 @@ class GNNModel(torch.nn.Module):
         return scores_all, {
             'nodes': nodes,
             'hidden': hidden,
-            'rule_scores': rule_scores,
-            'rule_uncertainty': rule_uncertainty,
             'q_rel': q_rel,
         }
