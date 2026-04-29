@@ -260,7 +260,7 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 ##########################################################################################################################################################################################
 
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, n_ent, d_rule, lambda_rule=0.2, lambda_msg=0.5, n_node_topk=-1, n_edge_topk=-1, tau=1.0, act=lambda x:x):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, n_ent, d_rule, n_node_topk=-1, n_edge_topk=-1, tau=1.0, act=lambda x:x):
         super(GNNLayer, self).__init__()
         self.n_rel       = n_rel
         self.n_ent       = n_ent
@@ -268,8 +268,6 @@ class GNNLayer(torch.nn.Module):
         self.out_dim     = out_dim
         self.attn_dim    = attn_dim
         self.d_rule      = d_rule
-        self.lambda_rule = lambda_rule
-        self.lambda_msg  = lambda_msg
         self.act         = act
         self.n_node_topk = n_node_topk
         self.n_edge_topk = n_edge_topk
@@ -281,6 +279,12 @@ class GNNLayer(torch.nn.Module):
         self.w_alpha     = nn.Linear(attn_dim, 1)
         self.W_h         = nn.Linear(in_dim, out_dim, bias=False)
         self.W_samp      = nn.Linear(in_dim, 1, bias=False)
+        self.rule_attn   = nn.Linear(d_rule, attn_dim, bias=True)
+        self.rule_msg    = nn.Linear(d_rule, 1, bias=True)
+        nn.init.zeros_(self.rule_attn.weight)
+        nn.init.zeros_(self.rule_attn.bias)
+        nn.init.zeros_(self.rule_msg.weight)
+        nn.init.zeros_(self.rule_msg.bias)
         
     def train(self, mode=True):
         if not isinstance(mode, bool):
@@ -309,16 +313,19 @@ class GNNLayer(torch.nn.Module):
         n_node  = nodes.shape[0]
 
         
-        base_logit = self.w_alpha(nn.ReLU()(self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr))).squeeze(-1)
+        base_attn_feat = self.Ws_attn(hs) + self.Wr_attn(hr) + self.Wqr_attn(h_qr)
         query_rule_edge = query_rule_pref[r_idx]
-        rule_score = F.cosine_similarity(edge_rule, query_rule_edge, dim=-1)
+        rule_context = edge_rule * query_rule_edge
         self_loop_mask = rel == (self.n_rel * 2)
         if self_loop_mask.any():
-            rule_score = rule_score.clone()
-            rule_score[self_loop_mask] = 0.0
-        rule_score = sanitize_tensor(rule_score, nan=0.0, posinf=1.0, neginf=-1.0, min_value=-1.0, max_value=1.0)
+            rule_context = rule_context.clone()
+            rule_context[self_loop_mask] = 0.0
+        rule_context = sanitize_tensor(rule_context, nan=0.0, posinf=1.0, neginf=-1.0, min_value=-1.0, max_value=1.0)
+        attn_scale = 2.0 * torch.sigmoid(self.rule_attn(rule_context))
+        attn_scale = sanitize_tensor(attn_scale, nan=1.0, posinf=2.0, neginf=0.0, min_value=0.0, max_value=2.0)
+        attn_feat = attn_scale * base_attn_feat
         alpha_logit = sanitize_tensor(
-            base_logit + self.lambda_rule * rule_score,
+            self.w_alpha(nn.ReLU()(attn_feat)).squeeze(-1),
             nan=-MAX_LOGIT,
             posinf=MAX_LOGIT,
             neginf=-MAX_LOGIT,
@@ -351,7 +358,7 @@ class GNNLayer(torch.nn.Module):
 
 
         # aggregate message and then propagate
-        rule_gate   = 2.0 * torch.sigmoid(self.lambda_msg * rule_score)
+        rule_gate   = 2.0 * torch.sigmoid(self.rule_msg(rule_context).squeeze(-1))
         rule_gate   = sanitize_tensor(rule_gate, nan=1.0, posinf=2.0, neginf=0.0, min_value=0.0, max_value=2.0)
         message     = alpha.unsqueeze(-1) * rule_gate.unsqueeze(-1) * message
         message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
@@ -423,8 +430,6 @@ class GNNModel(torch.nn.Module):
         self.n_node_topk = params.n_node_topk
         self.n_edge_topk = params.n_edge_topk
         self.loader      = loader
-        self.lambda_rule = params.lambda_rule
-        self.lambda_msg  = params.lambda_msg
         acts = {'relu': nn.ReLU(), 'tanh': torch.tanh, 'idd': lambda x:x}
         act  = acts[params.act]
         self.curvature = torch.nn.Parameter(torch.tensor(1.0))
@@ -433,7 +438,6 @@ class GNNModel(torch.nn.Module):
         for i in range(self.n_layer):
             i_n_node_topk = self.n_node_topk if 'int' in str(type(self.n_node_topk)) else self.n_node_topk[i]
             self.gnn_layers.append(GNNLayer(self.hidden_dim, self.hidden_dim, self.attn_dim, self.n_rel, self.n_ent, self.d_rule, \
-                                            lambda_rule=self.lambda_rule, lambda_msg=self.lambda_msg, \
                                             n_node_topk=i_n_node_topk, n_edge_topk=self.n_edge_topk, tau=params.tau, act=act))
 
         self.gnn_layers = nn.ModuleList(self.gnn_layers)       

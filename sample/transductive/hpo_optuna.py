@@ -121,8 +121,7 @@ def parse_args():
     parser.add_argument('--study_name', type=str, default=None)
     parser.add_argument('--storage', type=str, default=None)
     parser.add_argument('--weight', type=str, default=None)
-    parser.add_argument('--lambda_rule', type=float, default=0.2)
-    parser.add_argument('--lambda_msg', type=float, default=0.5)
+    parser.add_argument('--trial_json', '--trail_json', dest='trial_json', type=str, default=None)
     parser.add_argument('--buffer_dropout', type=float, default=0.1)
     return parser.parse_args()
 
@@ -166,6 +165,19 @@ def study_name_safe(study_name, dataset):
     return value.replace('/', '_').replace('\\', '_').replace(':', '_').replace(' ', '_')
 
 
+def load_trial_json(trial_json_arg):
+    if trial_json_arg is None:
+        return None
+    if os.path.isfile(trial_json_arg):
+        with open(trial_json_arg, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+    else:
+        payload = json.loads(trial_json_arg)
+    if not isinstance(payload, dict):
+        raise ValueError('--trial_json/--trail_json must be a JSON object or a path to a JSON object file')
+    return payload
+
+
 def unique_preserve_order(items):
     seen = set()
     ordered = []
@@ -200,8 +212,6 @@ def apply_dataset_defaults(opts, dataset):
     opts.n_tbatch = base['n_tbatch']
     opts.d_rule = 32 if getattr(opts, 'd_rule', -1) <= 0 else opts.d_rule
     opts.d_buffer = opts.hidden_dim if getattr(opts, 'd_buffer', -1) <= 0 else opts.d_buffer
-    opts.lambda_rule = getattr(opts, 'lambda_rule', 0.2)
-    opts.lambda_msg = getattr(opts, 'lambda_msg', 0.5)
     opts.buffer_dropout = getattr(opts, 'buffer_dropout', 0.1)
     return base
 
@@ -220,8 +230,6 @@ def build_search_space(dataset, base_cfg):
         'attn_dim': unique_preserve_order([base_cfg['attn_dim'], 2, 4, 5, 6, 8, 16]),
         'dropout': (0.0, 0.5),
         'act': unique_preserve_order([base_cfg['act'], 'idd', 'relu', 'tanh']),
-        'lambda_rule': (0.03, 0.5),
-        'lambda_msg': (0.05, 0.7),
         'buffer_dropout': (0.0, 0.3),
     }
 
@@ -246,10 +254,6 @@ def suggest_hyperparams(trial, opts, dataset, base_cfg):
     dropout_min, dropout_max = search_space['dropout']
     opts.dropout = trial.suggest_float('dropout', dropout_min, dropout_max)
     opts.act = trial.suggest_categorical('act', search_space['act'])
-    lr_min, lr_max = search_space['lambda_rule']
-    opts.lambda_rule = trial.suggest_float('lambda_rule', lr_min, lr_max)
-    lm_min, lm_max = search_space['lambda_msg']
-    opts.lambda_msg = trial.suggest_float('lambda_msg', lm_min, lm_max)
     bd_min, bd_max = search_space['buffer_dropout']
     opts.buffer_dropout = trial.suggest_float('buffer_dropout', bd_min, bd_max)
     opts.n_edge_topk = -1
@@ -283,8 +287,6 @@ def summarize_trial_opts(opts):
         'attn_dim': opts.attn_dim,
         'dropout': opts.dropout,
         'act': opts.act,
-        'lambda_rule': opts.lambda_rule,
-        'lambda_msg': opts.lambda_msg,
         'buffer_dropout': opts.buffer_dropout,
         'epoch': opts.epoch,
     }
@@ -292,20 +294,10 @@ def summarize_trial_opts(opts):
 
 def objective_factory(args, dataset, trial_log_path, checkpoint_dir):
     def objective(trial):
-        set_seed(args.seed)
-        opts = build_trial_opts(args, dataset, trial)
-        print(f'==> trial {trial.number} params: {json.dumps(summarize_trial_opts(opts), ensure_ascii=False)}')
-        loader = DataLoader(opts)
-        opts.n_ent = loader.n_ent
-        opts.n_rel = loader.n_rel
-
-        model = BaseModel(opts, loader)
-        model.modelName = f'{study_name_safe(opts.study_name if hasattr(opts, "study_name") else None, dataset)}-trial{trial.number}'
-        if opts.weight is not None:
-            model.loadModel(opts.weight)
-            model._update()
-            model.model.updateTopkNums(opts.n_node_topk)
-
+        opts = None
+        loader = None
+        model = None
+        current_stage = 'objective_start'
         best_v_mrr = float('-inf')
         best_t_mrr = float('-inf')
         best_epoch = 0
@@ -313,12 +305,38 @@ def objective_factory(args, dataset, trial_log_path, checkpoint_dir):
         trial_status = 'ok'
         best_ckpt_path = None
         try:
+            current_stage = 'set_seed'
+            print(f'==> trial {trial.number} stage: {current_stage}')
+            set_seed(args.seed)
+            current_stage = 'build_trial_opts'
+            print(f'==> trial {trial.number} stage: {current_stage}')
+            opts = build_trial_opts(args, dataset, trial)
+            print(f'==> trial {trial.number} params: {json.dumps(summarize_trial_opts(opts), ensure_ascii=False)}')
+            current_stage = 'build_dataloader'
+            print(f'==> trial {trial.number} stage: {current_stage}')
+            loader = DataLoader(opts)
+            opts.n_ent = loader.n_ent
+            opts.n_rel = loader.n_rel
+
+            current_stage = 'build_model'
+            print(f'==> trial {trial.number} stage: {current_stage}')
+            model = BaseModel(opts, loader)
+            model.modelName = f'{study_name_safe(opts.study_name if hasattr(opts, "study_name") else None, dataset)}-trial{trial.number}'
+            if opts.weight is not None:
+                current_stage = 'load_weight'
+                print(f'==> trial {trial.number} stage: {current_stage}')
+                model.loadModel(opts.weight)
+                model._update()
+                model.model.updateTopkNums(opts.n_node_topk)
+
             for epoch in range(opts.epoch):
+                current_stage = f'epoch_{epoch + 1}_train'
                 model.train_batch()
                 if (epoch + 1) % opts.eval_interval != 0:
                     continue
 
-                result_dict, out_str = model.evaluate(eval_val=True, eval_test=True, verbose=False)
+                current_stage = f'epoch_{epoch + 1}_eval'
+                result_dict, out_str = model.evaluate(eval_val=True, eval_test=True, verbose=True)
                 current_v_mrr = float(result_dict['v_mrr'])
                 current_t_mrr = float(result_dict['t_mrr'])
                 print(f'==> trial {trial.number} epoch {epoch + 1}: {out_str.strip()}')
@@ -360,7 +378,8 @@ def objective_factory(args, dataset, trial_log_path, checkpoint_dir):
             best_v_mrr = 0.0
             best_t_mrr = 0.0
             best_epoch = 0
-            stale_rounds = opts.early_stop_rounds
+            stale_rounds = getattr(opts, 'early_stop_rounds', args.early_stop_rounds)
+            print(f'==> trial {trial.number} OOM at stage: {current_stage}')
             if best_ckpt_path is not None and os.path.exists(best_ckpt_path):
                 os.remove(best_ckpt_path)
             best_ckpt_path = None
@@ -376,6 +395,7 @@ def objective_factory(args, dataset, trial_log_path, checkpoint_dir):
         trial.set_user_attr('status', trial_status)
         trial.set_user_attr('best_t_mrr', best_t_mrr)
         trial.set_user_attr('checkpoint_path', best_ckpt_path)
+        trial.set_user_attr('last_stage', current_stage)
 
         append_jsonl(
             trial_log_path,
@@ -385,13 +405,16 @@ def objective_factory(args, dataset, trial_log_path, checkpoint_dir):
                 'best_epoch': best_epoch,
                 'best_t_mrr': best_t_mrr,
                 'status': trial_status,
+                'last_stage': current_stage,
                 'checkpoint_path': best_ckpt_path,
                 'params': trial.params,
             },
         )
 
-        del model
-        del loader
+        if model is not None:
+            del model
+        if loader is not None:
+            del loader
         safe_cuda_empty_cache()
 
         return best_v_mrr
@@ -415,6 +438,7 @@ def main():
     dataset = infer_dataset_name(args.data_path)
     study_name = args.study_name or f'{dataset}_optuna_hpo'
     safe_study_name = study_name_safe(study_name, dataset)
+    fixed_trial_params = load_trial_json(args.trial_json)
 
     checkPath('./results/')
     checkPath(f'./results/{dataset}/')
@@ -443,9 +467,12 @@ def main():
         storage=args.storage,
         load_if_exists=True,
     )
+    if fixed_trial_params is not None:
+        print(f'==> enqueue fixed trial params: {json.dumps(fixed_trial_params, ensure_ascii=False)}')
+        study.enqueue_trial(fixed_trial_params)
 
     objective = objective_factory(args, dataset, trial_log_path, checkpoint_dir)
-    study.optimize(objective, n_trials=args.n_trials, gc_after_trial=True)
+    study.optimize(objective, n_trials=1 if fixed_trial_params is not None else args.n_trials, gc_after_trial=True)
 
     save_best_result(study, best_result_path)
 

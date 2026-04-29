@@ -29,8 +29,6 @@ parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--fact_ratio', type=float, default=0.9)
 parser.add_argument('--epoch', type=int, default=300)
 parser.add_argument('--eval_interval', type=int, default=1)
-parser.add_argument('--lambda_rule', type=float, default=0.2)
-parser.add_argument('--lambda_msg', type=float, default=0.5)
 parser.add_argument('--buffer_dropout', type=float, default=0.1)
 args = parser.parse_args()
 
@@ -151,8 +149,7 @@ if __name__ == '__main__':
         f.write(config_str)  
         f.write(
             f'd_rule={opts.d_rule}, d_buffer={opts.d_buffer}, '
-            f'buffer_dropout={opts.buffer_dropout:.4f}, '
-            f'lambda_rule={opts.lambda_rule:.4f}, lambda_msg={opts.lambda_msg:.4f}\n'
+            f'buffer_dropout={opts.buffer_dropout:.4f}\n'
         )
 
     if args.weight != None:
