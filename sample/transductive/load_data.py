@@ -48,10 +48,6 @@ class DataLoader:
         self.load_test_graph(self.double_triple(self.fact_triple)+self.double_triple(self.train_triple))
         self.valid_q, self.valid_a = self.load_query(self.valid_data)
         self.test_q,  self.test_a  = self.load_query(self.test_data)
-        self.valid_q = np.asarray(self.valid_q, dtype=np.int64)
-        self.test_q = np.asarray(self.test_q, dtype=np.int64)
-        self.valid_a = np.asarray(self.valid_a, dtype=object)
-        self.test_a = np.asarray(self.test_a, dtype=object)
         
         self.n_train = len(self.train_data)
         self.n_valid = len(self.valid_q)
@@ -155,9 +151,9 @@ class DataLoader:
         if data=='train':
             return np.array(self.train_data)[batch_idx]
         if data=='valid':
-            query, answer = self.valid_q, self.valid_a
+            query, answer = np.array(self.valid_q), np.array(self.valid_a)
         if data=='test':
-            query, answer = self.test_q, self.test_a
+            query, answer = np.array(self.test_q), np.array(self.test_a)
         
         subs = []
         rels = []

@@ -14,8 +14,6 @@ parser.add_argument('--seed', type=int, default=1234)
 parser.add_argument('--gpu', type=int, default=-1)
 parser.add_argument('--topk', type=int, default=-1)
 parser.add_argument('--layers', type=int, default=-1)
-parser.add_argument('--d_rule', type=int, default=32)
-parser.add_argument('--d_buffer', type=int, default=-1)
 parser.add_argument('--sampling', type=str, default='incremental')
 parser.add_argument('--weight', type=str, default=None)
 parser.add_argument('--tau', type=float, default=1.0)
@@ -29,7 +27,6 @@ parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--fact_ratio', type=float, default=0.9)
 parser.add_argument('--epoch', type=int, default=300)
 parser.add_argument('--eval_interval', type=int, default=1)
-parser.add_argument('--buffer_dropout', type=float, default=0.1)
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -128,11 +125,6 @@ if __name__ == '__main__':
         opts.n_edge_topk = -1
         opts.n_layer = opts.layers
         opts.n_batch = opts.n_tbatch = 5
-
-    if opts.d_rule <= 0:
-        opts.d_rule = 32
-    if opts.d_buffer <= 0:
-        opts.d_buffer = opts.hidden_dim
     
     # check all output paths
     checkPath('./results/')
@@ -147,10 +139,6 @@ if __name__ == '__main__':
     print(config_str)
     with open(opts.perf_file, 'a+') as f:
         f.write(config_str)  
-        f.write(
-            f'd_rule={opts.d_rule}, d_buffer={opts.d_buffer}, '
-            f'buffer_dropout={opts.buffer_dropout:.4f}\n'
-        )
 
     if args.weight != None:
         model.loadModel(args.weight)

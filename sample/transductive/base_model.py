@@ -63,18 +63,11 @@ class BaseModel(object):
         if layers != -1:
             extra_layers = self.model.gnn_layers[layers:]
             self.model.gnn_layers = self.model.gnn_layers[:layers]
-            load_result = self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
             self.model.gnn_layers += extra_layers
         else:
-            load_result = self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-            if 'optimizer_state_dict' in checkpoint:
-                try:
-                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                except ValueError:
-                    print('==> optimizer state is incompatible with current model; skip loading optimizer state.')
-        if load_result.missing_keys or load_result.unexpected_keys:
-            print(f'==> missing keys: {load_result.missing_keys}')
-            print(f'==> unexpected keys: {load_result.unexpected_keys}')
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
     def train_batch(self,):
         epoch_loss = 0
@@ -95,18 +88,16 @@ class BaseModel(object):
             pos_scores = scores[[torch.arange(len(scores)).cuda(), torch.LongTensor(triple[:,2]).cuda()]]
 
             max_n = torch.max(scores, 1, keepdim=True)[0]
-            loss = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1)))
-            if not torch.isfinite(loss):
-                print(f'==> skip non-finite training batch at step {i}: loss={loss.item() if torch.isfinite(loss) else "nan"}')
-                self.optimizer.zero_grad(set_to_none=True)
-                continue
+            loss = torch.sum(- pos_scores + max_n + torch.log(torch.sum(torch.exp(scores - max_n),1))) 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
             self.optimizer.step()
 
-            # avoid NaN / Inf
+            # avoid NaN
             for p in self.model.parameters():
-                p.data.copy_(torch.nan_to_num(p.data, nan=0.0, posinf=1.0, neginf=-1.0))
+                X = p.data.clone()
+                flag = X != X
+                X[flag] = np.random.random()
+                p.data.copy_(X)
             epoch_loss += loss.item()
 
         self.t_time += time.time() - t_time
@@ -136,9 +127,7 @@ class BaseModel(object):
                 end = min(n_data, (i+1)*batch_size)
                 batch_idx = np.arange(start, end)
                 subs, rels, objs = self.loader.get_batch(batch_idx, data='valid')
-                with torch.no_grad():
-                    scores = self.model(subs, rels, mode='valid')
-                scores = torch.nan_to_num(scores, nan=-1e6, posinf=1e6, neginf=-1e6)
+                scores = self.model(subs, rels, mode='valid')
                 scores = scores.data.cpu().numpy()
 
                 filters = []
@@ -171,9 +160,7 @@ class BaseModel(object):
                 end = min(n_data, (i+1)*batch_size)
                 batch_idx = np.arange(start, end)
                 subs, rels, objs = self.loader.get_batch(batch_idx, data='test')
-                with torch.no_grad():
-                    scores = self.model(subs, rels, mode='test')
-                scores = torch.nan_to_num(scores, nan=-1e6, posinf=1e6, neginf=-1e6)
+                scores = self.model(subs, rels, mode='test')
                 scores = scores.data.cpu().numpy()
 
                 filters = []
