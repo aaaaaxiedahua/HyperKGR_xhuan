@@ -280,11 +280,8 @@ class GNNLayer(torch.nn.Module):
         self.W_h         = nn.Linear(in_dim, out_dim, bias=False)
         self.W_samp      = nn.Linear(in_dim, 1, bias=False)
         self.rule_attn   = nn.Linear(d_rule, attn_dim, bias=True)
-        self.rule_msg    = nn.Linear(d_rule, 1, bias=True)
         nn.init.zeros_(self.rule_attn.weight)
         nn.init.zeros_(self.rule_attn.bias)
-        nn.init.zeros_(self.rule_msg.weight)
-        nn.init.zeros_(self.rule_msg.bias)
         
     def train(self, mode=True):
         if not isinstance(mode, bool):
@@ -321,9 +318,9 @@ class GNNLayer(torch.nn.Module):
             rule_context = rule_context.clone()
             rule_context[self_loop_mask] = 0.0
         rule_context = sanitize_tensor(rule_context, nan=0.0, posinf=1.0, neginf=-1.0, min_value=-1.0, max_value=1.0)
-        attn_scale = 2.0 * torch.sigmoid(self.rule_attn(rule_context))
-        attn_scale = sanitize_tensor(attn_scale, nan=1.0, posinf=2.0, neginf=0.0, min_value=0.0, max_value=2.0)
-        attn_feat = attn_scale * base_attn_feat
+        attn_delta = torch.tanh(self.rule_attn(rule_context))
+        attn_delta = sanitize_tensor(attn_delta, nan=0.0, posinf=1.0, neginf=-1.0, min_value=-1.0, max_value=1.0)
+        attn_feat = base_attn_feat + attn_delta
         alpha_logit = sanitize_tensor(
             self.w_alpha(nn.ReLU()(attn_feat)).squeeze(-1),
             nan=-MAX_LOGIT,
@@ -358,9 +355,7 @@ class GNNLayer(torch.nn.Module):
 
 
         # aggregate message and then propagate
-        rule_gate   = 2.0 * torch.sigmoid(self.rule_msg(rule_context).squeeze(-1))
-        rule_gate   = sanitize_tensor(rule_gate, nan=1.0, posinf=2.0, neginf=0.0, min_value=0.0, max_value=2.0)
-        message     = alpha.unsqueeze(-1) * rule_gate.unsqueeze(-1) * message
+        message     = alpha.unsqueeze(-1) * message
         message_agg = scatter(message, index=obj, dim=0, dim_size=n_node, reduce='sum')
 
         # to poincare space
