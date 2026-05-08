@@ -108,8 +108,8 @@ def parse_args():
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--topk', type=int, default=-1)
     parser.add_argument('--layers', type=int, default=-1)
-    parser.add_argument('--d_rule', type=int, default=32)
-    parser.add_argument('--d_buffer', type=int, default=-1)
+    parser.add_argument('--d_path', type=int, default=32)
+    parser.add_argument('--d_score', type=int, default=-1)
     parser.add_argument('--tau', type=float, default=1.0)
     parser.add_argument('--scheduler', type=str, default='exp')
     parser.add_argument('--remove_1hop_edges', action='store_true')
@@ -117,12 +117,12 @@ def parse_args():
     parser.add_argument('--epoch', type=int, default=120)
     parser.add_argument('--eval_interval', type=int, default=1)
     parser.add_argument('--n_trials', type=int, default=20)
+    parser.add_argument('--startup_random_trials', type=int, default=3)
     parser.add_argument('--early_stop_rounds', type=int, default=3)
     parser.add_argument('--study_name', type=str, default=None)
     parser.add_argument('--storage', type=str, default=None)
     parser.add_argument('--weight', type=str, default=None)
     parser.add_argument('--trial_json', '--trail_json', dest='trial_json', type=str, default=None)
-    parser.add_argument('--buffer_dropout', type=float, default=0.1)
     return parser.parse_args()
 
 
@@ -210,27 +210,28 @@ def apply_dataset_defaults(opts, dataset):
     opts.fact_ratio = base['fact_ratio']
     opts.n_batch = base['n_batch']
     opts.n_tbatch = base['n_tbatch']
-    opts.d_rule = 32 if getattr(opts, 'd_rule', -1) <= 0 else opts.d_rule
-    opts.d_buffer = opts.hidden_dim if getattr(opts, 'd_buffer', -1) <= 0 else opts.d_buffer
-    opts.buffer_dropout = getattr(opts, 'buffer_dropout', 0.1)
+    opts.d_path = 32 if getattr(opts, 'd_path', -1) <= 0 else opts.d_path
+    opts.d_score = opts.hidden_dim if getattr(opts, 'd_score', -1) <= 0 else opts.d_score
+    opts.n_node_topk = [opts.topk] * opts.layers
+    opts.n_edge_topk = -1
+    opts.n_layer = opts.layers
     return base
 
 
 def build_search_space(dataset, base_cfg):
     return {
         'layers': [4, 6, 8],
-        'topk': [900, 950, 1000, 1050, 1100],
-        'fact_ratio': (0.90, 0.95, 0.01),
+        'topk': [950, 1000, 1050],
+        'fact_ratio': (0.95, 0.96, 0.01),
         'lr': (1e-4, 1e-2, True),
         'decay_rate': (0.90, 0.9999, False),
         'lamb': (1e-7, 1e-2, True),
-        'hidden_dim': [32, 48, 64, 96, 128],
-        'd_rule': [16, 32, 48, 64],
-        'd_buffer': [16, 32, 64],
+        'hidden_dim': [32, 48, 64, 96],
+        'd_path': [16, 32, 48, 64],
+        'd_score': [32, 48, 64, 96],
         'attn_dim': unique_preserve_order([base_cfg['attn_dim'], 2, 4, 5, 6, 8, 16]),
         'dropout': (0.0, 0.5),
         'act': unique_preserve_order([base_cfg['act'], 'idd', 'relu', 'tanh']),
-        'buffer_dropout': (0.0, 0.3),
     }
 
 
@@ -248,14 +249,12 @@ def suggest_hyperparams(trial, opts, dataset, base_cfg):
     lamb_min, lamb_max, lamb_log = search_space['lamb']
     opts.lamb = trial.suggest_float('lamb', lamb_min, lamb_max, log=lamb_log)
     opts.hidden_dim = trial.suggest_categorical('hidden_dim', search_space['hidden_dim'])
-    opts.d_rule = trial.suggest_categorical('d_rule', search_space['d_rule'])
-    opts.d_buffer = trial.suggest_categorical('d_buffer', search_space['d_buffer'])
+    opts.d_path = trial.suggest_categorical('d_path', search_space['d_path'])
+    opts.d_score = trial.suggest_categorical('d_score', search_space['d_score'])
     opts.attn_dim = trial.suggest_categorical('attn_dim', search_space['attn_dim'])
     dropout_min, dropout_max = search_space['dropout']
     opts.dropout = trial.suggest_float('dropout', dropout_min, dropout_max)
     opts.act = trial.suggest_categorical('act', search_space['act'])
-    bd_min, bd_max = search_space['buffer_dropout']
-    opts.buffer_dropout = trial.suggest_float('buffer_dropout', bd_min, bd_max)
     opts.n_edge_topk = -1
     opts.n_layer = opts.layers
     opts.n_node_topk = [opts.topk] * opts.layers
@@ -282,17 +281,16 @@ def summarize_trial_opts(opts):
         'decay_rate': opts.decay_rate,
         'lamb': opts.lamb,
         'hidden_dim': opts.hidden_dim,
-        'd_rule': opts.d_rule,
-        'd_buffer': opts.d_buffer,
+        'd_path': opts.d_path,
+        'd_score': opts.d_score,
         'attn_dim': opts.attn_dim,
         'dropout': opts.dropout,
         'act': opts.act,
-        'buffer_dropout': opts.buffer_dropout,
         'epoch': opts.epoch,
     }
 
 
-def objective_factory(args, dataset, trial_log_path, checkpoint_dir):
+def objective_factory(args, dataset, trial_log_path):
     def objective(trial):
         opts = None
         loader = None
@@ -315,6 +313,7 @@ def objective_factory(args, dataset, trial_log_path, checkpoint_dir):
             current_stage = 'build_dataloader'
             print(f'==> trial {trial.number} stage: {current_stage}')
             loader = DataLoader(opts)
+            checkPath(f'{loader.task_dir}/saveModel/')
             opts.n_ent = loader.n_ent
             opts.n_rel = loader.n_rel
 
@@ -322,6 +321,23 @@ def objective_factory(args, dataset, trial_log_path, checkpoint_dir):
             print(f'==> trial {trial.number} stage: {current_stage}')
             model = BaseModel(opts, loader)
             model.modelName = f'{study_name_safe(opts.study_name if hasattr(opts, "study_name") else None, dataset)}-trial{trial.number}'
+            opts.perf_file = f'results/{dataset}/{model.modelName}_perf.txt'
+            config_str = '%.4f, %.4f, %.6f,  %d, %d, %d, %d, %.4f,%s, %d, %d\n' % (
+                opts.lr,
+                opts.decay_rate,
+                opts.lamb,
+                opts.hidden_dim,
+                opts.attn_dim,
+                opts.n_layer,
+                opts.n_batch,
+                opts.dropout,
+                opts.act,
+                opts.d_path,
+                opts.d_score,
+            )
+            print(config_str)
+            with open(opts.perf_file, 'a+', encoding='utf-8') as f:
+                f.write(config_str)
             if opts.weight is not None:
                 current_stage = 'load_weight'
                 print(f'==> trial {trial.number} stage: {current_stage}')
@@ -340,30 +356,17 @@ def objective_factory(args, dataset, trial_log_path, checkpoint_dir):
                 current_v_mrr = float(result_dict['v_mrr'])
                 current_t_mrr = float(result_dict['t_mrr'])
                 print(f'==> trial {trial.number} epoch {epoch + 1}: {out_str.strip()}')
+                with open(opts.perf_file, 'a+', encoding='utf-8') as f:
+                    f.write(f'==> trial {trial.number} epoch {epoch + 1}: {out_str}')
 
                 if current_v_mrr > best_v_mrr:
                     best_v_mrr = current_v_mrr
                     best_t_mrr = current_t_mrr
                     best_epoch = epoch + 1
                     stale_rounds = 0
-                    metric_str = f'ValMRR_{str(best_v_mrr)[:5]}_TestMRR_{str(best_t_mrr)[:5]}'
-                    ckpt_name = f'{study_name_safe(opts.study_name if hasattr(opts, "study_name") else None, dataset)}-trial{trial.number}-{metric_str}.pt'
-                    ckpt_path = os.path.join(checkpoint_dir, ckpt_name)
-                    torch.save(
-                        {
-                            'model_state_dict': model.model.state_dict(),
-                            'optimizer_state_dict': model.optimizer.state_dict(),
-                            'best_v_mrr': best_v_mrr,
-                            'best_t_mrr': best_t_mrr,
-                            'best_epoch': best_epoch,
-                            'trial': trial.number,
-                            'params': trial.params,
-                        },
-                        ckpt_path,
-                    )
-                    if best_ckpt_path is not None and best_ckpt_path != ckpt_path and os.path.exists(best_ckpt_path):
-                        os.remove(best_ckpt_path)
-                    best_ckpt_path = ckpt_path
+                    metric_str = f'epoch{epoch + 1}_ValMRR_{str(best_v_mrr)[:5]}_TestMRR_{str(best_t_mrr)[:5]}'
+                    model.saveModelToFiles(metric_str, deleteLastFile=True)
+                    best_ckpt_path = model.lastSaveGNNPath
                 else:
                     stale_rounds += 1
 
@@ -445,18 +448,21 @@ def main():
 
     trial_log_path = f'./results/{dataset}/{study_name}_trials.jsonl'
     best_result_path = f'./results/{dataset}/{study_name}_best.json'
-    checkpoint_dir = f'./results/{dataset}/{safe_study_name}_checkpoints'
-    checkPath(checkpoint_dir)
-
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
     print('==> gpu:', args.gpu)
     print('==> dataset:', dataset)
     print('==> study_name:', study_name)
+    startup_trial_count = args.startup_random_trials + (1 if fixed_trial_params is not None else 0)
+    print('==> startup_random_trials:', args.startup_random_trials)
+    if fixed_trial_params is not None:
+        print('==> startup schedule: 1 fixed trial + %d random trial(s), then TPE' % args.startup_random_trials)
+    else:
+        print('==> startup schedule: %d random trial(s), then TPE' % args.startup_random_trials)
 
     sampler = optuna.samplers.TPESampler(
         seed=args.seed,
-        n_startup_trials=3,
+        n_startup_trials=startup_trial_count,
     )
     pruner = optuna.pruners.NopPruner()
     study = optuna.create_study(
@@ -471,8 +477,8 @@ def main():
         print(f'==> enqueue fixed trial params: {json.dumps(fixed_trial_params, ensure_ascii=False)}')
         study.enqueue_trial(fixed_trial_params)
 
-    objective = objective_factory(args, dataset, trial_log_path, checkpoint_dir)
-    study.optimize(objective, n_trials=1 if fixed_trial_params is not None else args.n_trials, gc_after_trial=True)
+    objective = objective_factory(args, dataset, trial_log_path)
+    study.optimize(objective, n_trials=args.n_trials, gc_after_trial=True)
 
     save_best_result(study, best_result_path)
 

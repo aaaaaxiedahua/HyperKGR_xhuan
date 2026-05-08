@@ -1,0 +1,14 @@
+{
+  "layers": 8,
+  "topk": 1000,
+  "fact_ratio": 0.96,
+  "lr": 0.003,
+  "decay_rate": 0.994,
+  "lamb": 0.00014,
+  "hidden_dim": 64,
+  "d_path": 32,
+  "d_score": 64,
+  "attn_dim": 5,
+  "dropout": 0.02,
+  "act": "idd"
+}

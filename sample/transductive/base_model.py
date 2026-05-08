@@ -50,8 +50,11 @@ class BaseModel(object):
                 }, savePath)
 
         if deleteLastFile and self.lastSaveGNNPath != None:
-            print(f'Remove last checkpoint: {self.lastSaveGNNPath}')
-            os.remove(self.lastSaveGNNPath)
+            last_path = os.path.abspath(self.lastSaveGNNPath)
+            current_path = os.path.abspath(savePath)
+            if last_path != current_path and os.path.exists(self.lastSaveGNNPath):
+                print(f'Remove last checkpoint: {self.lastSaveGNNPath}')
+                os.remove(self.lastSaveGNNPath)
 
         self.lastSaveGNNPath = savePath
 
