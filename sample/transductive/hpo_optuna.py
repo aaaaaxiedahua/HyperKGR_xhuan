@@ -7,6 +7,8 @@ import random
 import numpy as np
 import optuna
 import torch
+from optuna.distributions import CategoricalDistribution, FloatDistribution
+from optuna.trial import TrialState
 
 from base_model import BaseModel
 from load_data import DataLoader
@@ -108,8 +110,6 @@ def parse_args():
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--topk', type=int, default=-1)
     parser.add_argument('--layers', type=int, default=-1)
-    parser.add_argument('--d_path', type=int, default=32)
-    parser.add_argument('--d_score', type=int, default=-1)
     parser.add_argument('--tau', type=float, default=1.0)
     parser.add_argument('--scheduler', type=str, default='exp')
     parser.add_argument('--remove_1hop_edges', action='store_true')
@@ -123,6 +123,10 @@ def parse_args():
     parser.add_argument('--storage', type=str, default=None)
     parser.add_argument('--weight', type=str, default=None)
     parser.add_argument('--trial_json', '--trail_json', dest='trial_json', type=str, default=None)
+    parser.add_argument('--resume_jsonl', type=str, default=None)
+    parser.add_argument('--rank_k', type=int, default=8)
+    parser.add_argument('--beta_rho', type=float, default=0.20)
+    parser.add_argument('--lambda_geom', type=float, default=0.30)
     return parser.parse_args()
 
 
@@ -210,8 +214,6 @@ def apply_dataset_defaults(opts, dataset):
     opts.fact_ratio = base['fact_ratio']
     opts.n_batch = base['n_batch']
     opts.n_tbatch = base['n_tbatch']
-    opts.d_path = 32 if getattr(opts, 'd_path', -1) <= 0 else opts.d_path
-    opts.d_score = opts.hidden_dim if getattr(opts, 'd_score', -1) <= 0 else opts.d_score
     opts.n_node_topk = [opts.topk] * opts.layers
     opts.n_edge_topk = -1
     opts.n_layer = opts.layers
@@ -227,11 +229,31 @@ def build_search_space(dataset, base_cfg):
         'decay_rate': (0.90, 0.9999, False),
         'lamb': (1e-7, 1e-2, True),
         'hidden_dim': [32, 48, 64, 96],
-        'd_path': [16, 32, 48, 64],
-        'd_score': [32, 48, 64, 96],
         'attn_dim': unique_preserve_order([base_cfg['attn_dim'], 2, 4, 5, 6, 8, 16]),
         'dropout': (0.0, 0.5),
         'act': unique_preserve_order([base_cfg['act'], 'idd', 'relu', 'tanh']),
+        'rank_k': [4, 8, 16, 32],
+        'beta_rho': (0.1, 0.5),
+        'lambda_geom': (0.1, 0.5),
+    }
+
+
+def build_search_distributions(dataset, base_cfg):
+    search_space = build_search_space(dataset, base_cfg)
+    return {
+        'layers': CategoricalDistribution(search_space['layers']),
+        'topk': CategoricalDistribution(search_space['topk']),
+        'fact_ratio': FloatDistribution(search_space['fact_ratio'][0], search_space['fact_ratio'][1], step=search_space['fact_ratio'][2]),
+        'lr': FloatDistribution(search_space['lr'][0], search_space['lr'][1], log=search_space['lr'][2]),
+        'decay_rate': FloatDistribution(search_space['decay_rate'][0], search_space['decay_rate'][1]),
+        'lamb': FloatDistribution(search_space['lamb'][0], search_space['lamb'][1], log=search_space['lamb'][2]),
+        'hidden_dim': CategoricalDistribution(search_space['hidden_dim']),
+        'attn_dim': CategoricalDistribution(search_space['attn_dim']),
+        'dropout': FloatDistribution(search_space['dropout'][0], search_space['dropout'][1]),
+        'act': CategoricalDistribution(search_space['act']),
+        'rank_k': CategoricalDistribution(search_space['rank_k']),
+        'beta_rho': FloatDistribution(search_space['beta_rho'][0], search_space['beta_rho'][1]),
+        'lambda_geom': FloatDistribution(search_space['lambda_geom'][0], search_space['lambda_geom'][1]),
     }
 
 
@@ -249,12 +271,15 @@ def suggest_hyperparams(trial, opts, dataset, base_cfg):
     lamb_min, lamb_max, lamb_log = search_space['lamb']
     opts.lamb = trial.suggest_float('lamb', lamb_min, lamb_max, log=lamb_log)
     opts.hidden_dim = trial.suggest_categorical('hidden_dim', search_space['hidden_dim'])
-    opts.d_path = trial.suggest_categorical('d_path', search_space['d_path'])
-    opts.d_score = trial.suggest_categorical('d_score', search_space['d_score'])
     opts.attn_dim = trial.suggest_categorical('attn_dim', search_space['attn_dim'])
     dropout_min, dropout_max = search_space['dropout']
     opts.dropout = trial.suggest_float('dropout', dropout_min, dropout_max)
     opts.act = trial.suggest_categorical('act', search_space['act'])
+    opts.rank_k = trial.suggest_categorical('rank_k', search_space['rank_k'])
+    beta_rho_min, beta_rho_max = search_space['beta_rho']
+    opts.beta_rho = trial.suggest_float('beta_rho', beta_rho_min, beta_rho_max)
+    lambda_geom_min, lambda_geom_max = search_space['lambda_geom']
+    opts.lambda_geom = trial.suggest_float('lambda_geom', lambda_geom_min, lambda_geom_max)
     opts.n_edge_topk = -1
     opts.n_layer = opts.layers
     opts.n_node_topk = [opts.topk] * opts.layers
@@ -281,13 +306,73 @@ def summarize_trial_opts(opts):
         'decay_rate': opts.decay_rate,
         'lamb': opts.lamb,
         'hidden_dim': opts.hidden_dim,
-        'd_path': opts.d_path,
-        'd_score': opts.d_score,
         'attn_dim': opts.attn_dim,
         'dropout': opts.dropout,
         'act': opts.act,
+        'rank_k': opts.rank_k,
+        'beta_rho': opts.beta_rho,
+        'lambda_geom': opts.lambda_geom,
         'epoch': opts.epoch,
     }
+
+
+def load_jsonl_records(path):
+    records = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+    return records
+
+
+def import_trials_from_jsonl(study, args, dataset, resume_jsonl):
+    if not resume_jsonl:
+        return 0
+
+    if len(study.trials) > 0:
+        print(f'==> skip importing {resume_jsonl} because study already contains {len(study.trials)} trial(s).')
+        return 0
+
+    opts = copy.deepcopy(args)
+    base_cfg = apply_dataset_defaults(opts, dataset)
+    distributions = build_search_distributions(dataset, base_cfg)
+    expected_keys = set(distributions.keys())
+    imported = 0
+
+    for record in load_jsonl_records(resume_jsonl):
+        params = record.get('params')
+        value = record.get('value')
+        status = record.get('status', 'ok')
+        if status != 'ok' or params is None or value is None:
+            continue
+
+        param_keys = set(params.keys())
+        if param_keys != expected_keys:
+            print(f'==> skip imported trial {record.get("trial")} due to param mismatch: {sorted(param_keys ^ expected_keys)}')
+            continue
+
+        trial = optuna.trial.create_trial(
+            params=params,
+            distributions=distributions,
+            value=float(value),
+            state=TrialState.COMPLETE,
+            user_attrs={
+                'best_epoch': record.get('best_epoch'),
+                'best_t_mrr': record.get('best_t_mrr'),
+                'status': status,
+                'checkpoint_path': record.get('checkpoint_path'),
+                'last_stage': record.get('last_stage'),
+                'imported_from_jsonl': resume_jsonl,
+                'original_trial': record.get('trial'),
+            },
+        )
+        study.add_trial(trial)
+        imported += 1
+
+    print(f'==> imported {imported} completed trial(s) from {resume_jsonl}')
+    return imported
 
 
 def objective_factory(args, dataset, trial_log_path):
@@ -322,7 +407,7 @@ def objective_factory(args, dataset, trial_log_path):
             model = BaseModel(opts, loader)
             model.modelName = f'{study_name_safe(opts.study_name if hasattr(opts, "study_name") else None, dataset)}-trial{trial.number}'
             opts.perf_file = f'results/{dataset}/{model.modelName}_perf.txt'
-            config_str = '%.4f, %.4f, %.6f,  %d, %d, %d, %d, %.4f,%s, %d, %d\n' % (
+            config_str = '%.4f, %.4f, %.6f,  %d, %d, %d, %d, %.4f,%s, %d, %.4f, %.4f\n' % (
                 opts.lr,
                 opts.decay_rate,
                 opts.lamb,
@@ -332,8 +417,9 @@ def objective_factory(args, dataset, trial_log_path):
                 opts.n_batch,
                 opts.dropout,
                 opts.act,
-                opts.d_path,
-                opts.d_score,
+                opts.rank_k,
+                opts.beta_rho,
+                opts.lambda_geom,
             )
             print(config_str)
             with open(opts.perf_file, 'a+', encoding='utf-8') as f:
@@ -473,9 +559,12 @@ def main():
         storage=args.storage,
         load_if_exists=True,
     )
+    imported_trials = import_trials_from_jsonl(study, args, dataset, args.resume_jsonl)
     if fixed_trial_params is not None:
         print(f'==> enqueue fixed trial params: {json.dumps(fixed_trial_params, ensure_ascii=False)}')
         study.enqueue_trial(fixed_trial_params)
+    if imported_trials > 0:
+        print(f'==> resume mode: continuing after {imported_trials} imported trial(s)')
 
     objective = objective_factory(args, dataset, trial_log_path)
     study.optimize(objective, n_trials=args.n_trials, gc_after_trial=True)

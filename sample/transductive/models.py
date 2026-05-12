@@ -254,14 +254,16 @@ def hyp_distance_multi_c(x, v, c, eval_mode=False):
 ##########################################################################################################################################################################################
 
 class GNNLayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, attn_dim, n_rel, n_ent, d_path, n_node_topk=-1, n_edge_topk=-1, tau=1.0, act=lambda x:x):
+    def __init__(self, in_dim, out_dim, attn_dim, n_rel, n_ent, rank_k, beta_rho, lambda_geom, n_node_topk=-1, n_edge_topk=-1, tau=1.0, act=lambda x:x):
         super(GNNLayer, self).__init__()
         self.n_rel       = n_rel
         self.n_ent       = n_ent
         self.in_dim      = in_dim
         self.out_dim     = out_dim
         self.attn_dim    = attn_dim
-        self.d_path      = d_path
+        self.rank_k      = rank_k
+        self.beta_rho    = beta_rho
+        self.lambda_geom = lambda_geom
         self.act         = act
         self.n_node_topk = n_node_topk
         self.n_edge_topk = n_edge_topk
@@ -273,8 +275,12 @@ class GNNLayer(torch.nn.Module):
         self.w_alpha     = nn.Linear(attn_dim, 1)
         self.W_h         = nn.Linear(in_dim, out_dim, bias=False)
         self.W_samp      = nn.Linear(in_dim, 1, bias=False)
-        self.W_path_prev = nn.Linear(d_path, d_path, bias=False)
-        self.W_path_rel  = nn.Linear(in_dim, d_path, bias=False)
+        self.W_a         = nn.Linear(in_dim, rank_k, bias=False)
+        self.U_ang       = nn.Parameter(torch.empty(in_dim, rank_k))
+        self.V_ang       = nn.Parameter(torch.empty(in_dim, rank_k))
+        self.w_rho       = nn.Linear(in_dim, 1, bias=False)
+        nn.init.xavier_uniform_(self.U_ang)
+        nn.init.xavier_uniform_(self.V_ang)
 
         # if the dataset is NELL, make it not changable
         self.curvature = torch.nn.Parameter(torch.tensor(1.0))
@@ -291,14 +297,13 @@ class GNNLayer(torch.nn.Module):
             module.train(mode)
         return self
 
-    def forward(self, q_sub, q_rel, hidden, path_state, edges, nodes, old_nodes_new_idx, batchsize):
+    def forward(self, q_sub, q_rel, hidden, edges, nodes, old_nodes_new_idx, batchsize):
         # edges: [N_edge_of_all_batch, 6]
         # with (batch_idx, head, rela, tail, head_idx, tail_idx)
         sub    = edges[:,4]
         rel    = edges[:,2]
         obj    = edges[:,5]
         hs     = hidden[sub]
-        hp     = path_state[sub]
         hr     = self.rela_embed(rel)
         r_idx  = edges[:,0]
         h_qr   = self.rela_embed(q_rel)[r_idx]
@@ -316,17 +321,25 @@ class GNNLayer(torch.nn.Module):
         else:
             alpha = torch.sigmoid(attn_logits).unsqueeze(-1)
 
-        path_edge = torch.tanh(self.W_path_prev(hp) + self.W_path_rel(hr))
+        a_r = self.W_a(hr)
+        proj_v = hs @ self.V_ang
+        ang_delta = (proj_v * a_r) @ self.U_ang.T
+        hs_ang = hs + ang_delta
+        rho_r = torch.tanh(self.w_rho(hr))
+        hs_geom = (1.0 + self.beta_rho * rho_r) * hs_ang
 
         # suppose all embedding are in tangent space
         hr = expmap0(hr, self.curvature)
         hs = expmap0(hs, self.curvature)
+        hs_geom = expmap0(hs_geom, self.curvature)
 
-        message = project(mobius_add(hs, hr, self.curvature), self.curvature)
-        message = logmap0(message, self.curvature)
+        message_base = project(mobius_add(hs, hr, self.curvature), self.curvature)
+        message_base = logmap0(message_base, self.curvature)
+        message_geom = project(mobius_add(hs_geom, hr, self.curvature), self.curvature)
+        message_geom = logmap0(message_geom, self.curvature)
+        message = (1.0 - self.lambda_geom) * message_base + self.lambda_geom * message_geom
 
         message_agg = scatter(alpha * message, index=obj, dim=0, dim_size=n_node, reduce='sum')
-        path_state_new = scatter(alpha * path_edge, index=obj, dim=0, dim_size=n_node, reduce='sum')
 
         a__ = self.W_h(message_agg)
         a__ = expmap0(a__, self.curvature)
@@ -334,10 +347,9 @@ class GNNLayer(torch.nn.Module):
         hidden_new = logmap0(hidden_new, self.curvature)
 
         hidden_new = hidden_new.clone()
-        path_state_new = path_state_new.clone()
 
         if self.n_node_topk <= 0:
-            return hidden_new, path_state_new
+            return hidden_new
 
         tmp_diff_node_idx = torch.ones(n_node, device=hidden_new.device)
         tmp_diff_node_idx[old_nodes_new_idx] = 0
@@ -363,13 +375,11 @@ class GNNLayer(torch.nn.Module):
         diff_node_prob = node_scores[diff_node[:,0], diff_node[:,1]]
         sample_gate = (diff_node_prob_hard - diff_node_prob.detach() + diff_node_prob).unsqueeze(-1)
         hidden_new[bool_diff_node_idx] *= sample_gate
-        path_state_new[bool_diff_node_idx] *= sample_gate
 
         new_nodes = nodes[bool_same_node_idx]
         hidden_new = hidden_new[bool_same_node_idx]
-        path_state_new = path_state_new[bool_same_node_idx]
 
-        return hidden_new, path_state_new, new_nodes, bool_same_node_idx
+        return hidden_new, new_nodes, bool_same_node_idx
 
 
 class GNNModel(torch.nn.Module):
@@ -378,8 +388,9 @@ class GNNModel(torch.nn.Module):
         self.n_layer     = params.n_layer
         self.hidden_dim  = params.hidden_dim
         self.attn_dim    = params.attn_dim
-        self.d_path      = params.d_path
-        self.d_score     = params.d_score
+        self.rank_k      = params.rank_k
+        self.beta_rho    = params.beta_rho
+        self.lambda_geom = params.lambda_geom
         self.n_ent       = params.n_ent
         self.n_rel       = params.n_rel
         self.n_node_topk = params.n_node_topk
@@ -397,7 +408,9 @@ class GNNModel(torch.nn.Module):
                 self.attn_dim,
                 self.n_rel,
                 self.n_ent,
-                self.d_path,
+                self.rank_k,
+                self.beta_rho,
+                self.lambda_geom,
                 n_node_topk=i_n_node_topk,
                 n_edge_topk=self.n_edge_topk,
                 tau=params.tau,
@@ -407,15 +420,7 @@ class GNNModel(torch.nn.Module):
         self.gnn_layers = nn.ModuleList(self.gnn_layers)
         self.dropout = nn.Dropout(params.dropout)
         self.gate = nn.GRU(self.hidden_dim, self.hidden_dim)
-
-        self.query_rela_embed = nn.Embedding(2 * self.n_rel + 1, self.hidden_dim)
-        self.path_init = nn.Linear(self.hidden_dim, self.d_path, bias=False)
-        self.W_path_fuse = nn.Linear(self.d_path, self.hidden_dim, bias=False)
-        self.W_score_node = nn.Linear(self.hidden_dim, self.d_score, bias=False)
-        self.W_score_rel = nn.Linear(self.hidden_dim, self.d_score, bias=False)
         self.W_final = nn.Linear(self.hidden_dim, 1, bias=False)
-        self.score_curvature = nn.Parameter(torch.tensor(1.0))
-        self.score_scale = max(float(self.d_score), 1.0) ** 0.5
 
     def updateTopkNums(self, topk_list):
         assert len(topk_list) == self.n_layer
@@ -428,22 +433,6 @@ class GNNModel(torch.nn.Module):
         for i in range(self.n_layer):
             self.gnn_layers[i].W_samp.apply(freeze)
 
-    def path_hyperbolic_fuse(self, hidden, path_state):
-        path_proj = torch.tanh(self.W_path_fuse(path_state))
-        hidden_hyp = expmap0(hidden, self.score_curvature)
-        path_hyp = expmap0(path_proj, self.score_curvature)
-        fused_hyp = project(mobius_add(hidden_hyp, path_hyp, self.score_curvature), self.score_curvature)
-        return logmap0(fused_hyp, self.score_curvature)
-
-    def relation_aware_hscore(self, fused_hidden, nodes, q_rel):
-        batch_idx = nodes[:,0]
-        node_tangent = torch.tanh(self.W_score_node(fused_hidden))
-        rel_tangent = torch.tanh(self.W_score_rel(self.query_rela_embed(q_rel)))[batch_idx]
-        node_hyp = expmap0(node_tangent, self.score_curvature)
-        rel_hyp = expmap0(rel_tangent, self.score_curvature)
-        dist = hyp_distance(node_hyp, rel_hyp, self.score_curvature, eval_mode=False).squeeze(-1)
-        return -dist / self.score_scale
-
     def forward(self, subs, rels, mode='train'):
         n = len(subs)
         q_sub = torch.LongTensor(subs).cuda()
@@ -451,18 +440,17 @@ class GNNModel(torch.nn.Module):
         h0 = torch.zeros((1, n, self.hidden_dim)).cuda()
         nodes = torch.cat([torch.arange(n).unsqueeze(1).cuda(), q_sub.unsqueeze(1)], 1)
         hidden = torch.zeros(n, self.hidden_dim).cuda()
-        path_state = torch.tanh(self.path_init(self.query_rela_embed(q_rel)))
 
         for i in range(self.n_layer):
             nodes, edges, old_nodes_new_idx = self.loader.get_neighbors(nodes.data.cpu().numpy(), n, mode=mode)
             n_node = nodes.size(0)
 
-            layer_out = self.gnn_layers[i](q_sub, q_rel, hidden, path_state, edges, nodes, old_nodes_new_idx, n)
-            if len(layer_out) == 2:
-                hidden, path_state = layer_out
-                sampled_nodes_idx = torch.arange(hidden.size(0), device=hidden.device)
+            layer_out = self.gnn_layers[i](q_sub, q_rel, hidden, edges, nodes, old_nodes_new_idx, n)
+            if isinstance(layer_out, tuple):
+                hidden, nodes, sampled_nodes_idx = layer_out
             else:
-                hidden, path_state, nodes, sampled_nodes_idx = layer_out
+                hidden = layer_out
+                sampled_nodes_idx = torch.arange(hidden.size(0), device=hidden.device)
 
             h0 = torch.zeros(1, n_node, hidden.size(1), device=hidden.device).index_copy_(1, old_nodes_new_idx, h0)
             h0 = h0[0, sampled_nodes_idx, :].unsqueeze(0)
@@ -470,11 +458,8 @@ class GNNModel(torch.nn.Module):
             hidden, h0 = self.gate(hidden.unsqueeze(0), h0)
             hidden = hidden.squeeze(0)
 
-        fused_hidden = self.path_hyperbolic_fuse(hidden, path_state)
-        base_scores = self.W_final(fused_hidden).squeeze(-1)
-        hyp_scores = self.relation_aware_hscore(fused_hidden, nodes, q_rel)
-        scores = base_scores + hyp_scores
+        base_scores = self.W_final(hidden).squeeze(-1)
         scores_all = torch.zeros((n, self.loader.n_ent), device=hidden.device)
-        scores_all[[nodes[:,0], nodes[:,1]]] = scores
+        scores_all[[nodes[:,0], nodes[:,1]]] = base_scores
 
         return scores_all

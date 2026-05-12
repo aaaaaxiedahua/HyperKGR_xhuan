@@ -27,8 +27,9 @@ parser.add_argument('--remove_1hop_edges', action='store_true')
 parser.add_argument('--fact_ratio', type=float, default=0.9)
 parser.add_argument('--epoch', type=int, default=300)
 parser.add_argument('--eval_interval', type=int, default=1)
-parser.add_argument('--d_path', type=int, default=32)
-parser.add_argument('--d_score', type=int, default=-1)
+parser.add_argument('--rank_k', type=int, default=8)
+parser.add_argument('--beta_rho', type=float, default=0.20)
+parser.add_argument('--lambda_geom', type=float, default=0.30)
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -133,16 +134,11 @@ if __name__ == '__main__':
     checkPath(f'./results/{dataset}/')
     checkPath(f'{loader.task_dir}/saveModel/')
 
-    if opts.d_path <= 0:
-        opts.d_path = min(32, opts.hidden_dim)
-    if opts.d_score <= 0:
-        opts.d_score = opts.hidden_dim
-
     model = BaseModel(opts, loader)
     opts.perf_file = f'results/{dataset}/{model.modelName}_perf.txt'
     print(f'==> perf_file: {opts.perf_file}')
     
-    config_str = '%.4f, %.4f, %.6f,  %d, %d, %d, %d, %.4f,%s, %d, %d\n' % (
+    config_str = '%.4f, %.4f, %.6f,  %d, %d, %d, %d, %.4f,%s, %d, %.4f, %.4f\n' % (
         opts.lr,
         opts.decay_rate,
         opts.lamb,
@@ -152,8 +148,9 @@ if __name__ == '__main__':
         opts.n_batch,
         opts.dropout,
         opts.act,
-        opts.d_path,
-        opts.d_score,
+        opts.rank_k,
+        opts.beta_rho,
+        opts.lambda_geom,
     )
     print(config_str)
     with open(opts.perf_file, 'a+') as f:
